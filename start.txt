@@ -1,0 +1,17 @@
+& .\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 3000 `
+  --traj_list zigzag3d lemniscate3d random_wp spiral_in_out stairs coupled_surface `
+  --aggregate harmonic --duration 20 --disturbance mild_wind --log-skip 2 `
+  --compose-by-gain --clip-D 1.2 `
+  --traj-batch-size 3 --parallel-traj --num-workers 0 `
+  --test-traj-preset test_extreme --test-verify-every 200 `
+  --ml-scheduler nn --ml-path 01_pi_flight/results/nn_trained/ml_sched_warmstart.pt --ml-interval 5 --ml-warmup-iters 300 --ml-log `
+  --stagnation-seconds 600 --epsilon-rebound-target 0.35 --time-rebound-iters 150 `
+  --rebound-decay-iters 60 --rebound-target-eps 0.18 `
+  --auto-unfreeze-patience 2 --auto-unfreeze-steps 80 --auto-unfreeze-penalty-scale 0.4 --auto-unfreeze-eps-boost 0.30 `
+  --prefer-fewer-rules-tie-delta 0.01 `
+  --epsilon-max 0.50 --epsilon-end-progress 0.70 `
+  --short-duration 10 --full-duration 20 `
+  --save-every 200 --quiet-sim --quiet-eval --in-memory-log `
+  --warm_start_cmaes --warm_start_path 01_pi_flight\results\best_program_backup_3.42.json `
+  --save-program 01_pi_flight\results\best_program_mcts_nn_warmstart.json

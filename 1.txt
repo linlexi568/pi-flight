@@ -1,0 +1,438 @@
+PI-Light 一页起步（统一口径 | 精简指令）
+=====================================
+
+默认在 PowerShell 中执行，虚拟环境为 `.venv`。
+
+统一口径（训练/验证/对比都按此）：
+- 轨迹（训练）：test_challenge（6 条）
+- 轨迹（测试）：test_extreme（5 条极端参数版本）
+- 聚合：harmonic
+- 扰动：mild_wind
+- 时长：20s；log-skip：2
+- 组合：compose-by-gain 开启；裁剪：clip-D=1.2
+- 奖励档：pilight_boost
+
+训练/测试分离：
+- 训练集：zigzag3d, lemniscate3d, random_wp, spiral_in_out, stairs, coupled_surface (6条)
+- 测试集：coupled_surface_extreme, zigzag3d_aggressive, lemniscate3d_wild, spiral_chaotic, stairs_harsh (5条极端版)
+- 基线泛化：3.4204 → 3.2455 (降低5.1%)
+- 目标：多规则程序泛化损失 < 3%
+
+一、最小训练（多轨迹 + 全长复核门控）
+------------------------------------
+```powershell
+& .\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 120 `
+  --traj_list zigzag3d lemniscate3d random_wp spiral_in_out stairs coupled_surface `
+  --aggregate harmonic `
+  --disturbance mild_wind `
+  --verify-best-every 10 `
+  --verify-start-iter 10 `
+  --mini-full-every 5 `
+  --mini-full-frac 0.5 `
+  --short-duration 5 `
+  --full-duration 20 `
+  --traj-batch-size 2 `
+  --quiet-sim --quiet-eval
+```
+
+并行训练（烟测/长跑，推荐）
+--------------------------------
+烟测（50 iter，轮转 3 轨，起步即全评种子 = ~3.4467）
+```powershell
+& .\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 50 `
+  --traj_list zigzag3d lemniscate3d random_wp spiral_in_out stairs coupled_surface `
+  --aggregate harmonic --duration 20 --disturbance mild_wind --log-skip 2 `
+  --compose-by-gain --clip-D 1.2 `
+  --traj-batch-size 3 `
+  --parallel-traj --num-workers 0 `
+  --mini-full-every 5 --mini-full-frac 0.5 `
+  --verify-best-every 10 --verify-start-iter 10 `
+  --quiet-sim --quiet-eval --in-memory-log `
+  --warm_start_cmaes --warm_start_path 01_pi_flight\results\best_program.json
+```
+
+长跑（3000+ iter，含反弹/结构爆发）
+```powershell
+& .\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 3000 `
+  --traj_list zigzag3d lemniscate3d random_wp spiral_in_out stairs coupled_surface `
+  --aggregate harmonic --duration 20 --disturbance mild_wind --log-skip 2 `
+  --compose-by-gain --clip-D 1.2 `
+  --traj-batch-size 3 `
+  --parallel-traj --num-workers 0 `
+  --mini-full-every 5 --mini-full-frac 0.5 `
+  --verify-best-every 10 --verify-start-iter 10 `
+  --stagnation-seconds 900 --epsilon-rebound-target 0.22 --time-rebound-iters 120 `
+  --rebound-decay-iters 80 --rebound-target-eps 0.12 `
+  --auto-unfreeze-patience 4 --auto-unfreeze-steps 120 --auto-unfreeze-penalty-scale 0.6 --auto-unfreeze-eps-boost 0.18 `
+  --structure-burst-patience 400 --structure-burst-steps 120 --structure-burst-min-rules 4 --structure-burst-add-bias 4 --structure-burst-prefer-more-delta 0.03 `
+  --search-preset balanced `
+  --save-every 500 --quiet-sim --quiet-eval --in-memory-log `
+  --warm_start_cmaes --warm_start_path 01_pi_flight\results\best_program.json
+```
+
+夜间长跑（≈14 小时，目标高值）
+--------------------------------
+说明：当前并行吞吐约 0.20~0.30 it/s；14 小时约 50,400 秒，对应 12,000~15,000 iter。先给出 14,000 iter 方案，运行中可随时中断，之后继续用相同 warm_start 路径再开一轮即可近似续跑。
+```powershell
+& .\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 14000 `
+  --traj_list zigzag3d lemniscate3d random_wp spiral_in_out stairs coupled_surface `
+  --aggregate harmonic --duration 20 --disturbance mild_wind --log-skip 2 `
+  --compose-by-gain --clip-D 1.2 `
+  --allowed-cond-unaries identity,abs,sin,cos --trig-as-phase-window --trig-lt-max 0.20 `
+  --traj-batch-size 3 `
+  --parallel-traj --num-workers 0 `
+  --mini-full-every 5 --mini-full-frac 0.5 `
+  --verify-best-every 10 --verify-start-iter 10 `
+  --stagnation-seconds 900 --epsilon-rebound-target 0.22 --time-rebound-iters 120 `
+  --rebound-decay-iters 80 --rebound-target-eps 0.12 `
+  --auto-unfreeze-patience 4 --auto-unfreeze-steps 120 --auto-unfreeze-penalty-scale 0.6 --auto-unfreeze-eps-boost 0.18 `
+  --structure-burst-patience 400 --structure-burst-steps 120 --structure-burst-min-rules 4 --structure-burst-add-bias 4 --structure-burst-prefer-more-delta 0.03 `
+  --search-preset balanced `
+  --save-every 500 --quiet-sim --quiet-eval --in-memory-log `
+  --warm_start_cmaes --warm_start_path 01_pi_flight\results\best_program.json
+```
+小贴士：
+- 运行期间 `01_pi_flight\results\iter_log.csv` 可随时查看进度与 best_full_reward 变化；`--save-every 500` 会周期性刷新 `best_program.json`。
+- 中断后“续跑”：继续使用同一条命令（warm_start 指向当前 `best_program.json`），InitVerify 会从现有最优种子开始；若要保留历史拷贝，请先备份 JSON 再续跑。
+
+夜跑（促分支-保守）
+---------------------
+说明：更早/更强的结构爆发，轻度偏好多分段，三角相位窗有利于形成可分割区间；适合先行尝试。
+```powershell
+& .\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 14000 `
+  --traj_list zigzag3d lemniscate3d random_wp spiral_in_out stairs coupled_surface `
+  --aggregate harmonic --duration 20 --disturbance mild_wind --log-skip 2 `
+  --compose-by-gain --clip-D 1.2 `
+  --traj-batch-size 3 `
+  --parallel-traj --num-workers 0 `
+  --mini-full-every 5 --mini-full-frac 0.5 `
+  --verify-best-every 10 --verify-start-iter 10 `
+  --structure-burst-patience 120 --structure-burst-steps 200 --structure-burst-min-rules 5 --structure-burst-add-bias 6 --structure-burst-prefer-more-delta 0.05 `
+  --prefer-more-rules-tie-delta 0.03 `
+  --allowed-cond-unaries identity,abs,sin,cos --trig-as-phase-window --trig-lt-max 0.20 `
+  --epsilon-max 0.32 --epsilon-end-progress 0.50 `
+  --auto-unfreeze-patience 3 --auto-unfreeze-steps 150 --auto-unfreeze-penalty-scale 0.6 --auto-unfreeze-eps-boost 0.22 `
+  --search-preset balanced `
+  --save-every 500 --quiet-sim --quiet-eval --in-memory-log `
+  --warm_start_cmaes --warm_start_path 01_pi_flight\results\best_program.json
+```
+
+夜跑（促分支-激进）
+---------------------
+说明：推迟 gate 至 100 轮，初期结构变化更易被接受；结构爆发更猛更频，tie-break 更偏好多段。若保守方案 30–60 分钟仍不分支再用它。
+```powershell
+& .\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 14000 `
+  --traj_list zigzag3d lemniscate3d random_wp spiral_in_out stairs coupled_surface `
+  --aggregate harmonic --duration 20 --disturbance mild_wind --log-skip 2 `
+  --compose-by-gain --clip-D 1.2 `
+  --traj-batch-size 3 `
+  --parallel-traj --num-workers 0 `
+  --mini-full-every 5 --mini-full-frac 0.5 `
+  --verify-best-every 10 --verify-start-iter 10 --gate-start-iter 100 `
+  --structure-burst-patience 100 --structure-burst-steps 240 --structure-burst-min-rules 6 --structure-burst-add-bias 8 --structure-burst-prefer-more-delta 0.06 `
+  --prefer-more-rules-tie-delta 0.05 `
+  --allowed-cond-unaries identity,abs,sin,cos --trig-as-phase-window --trig-lt-max 0.18 `
+  --epsilon-max 0.35 --epsilon-end-progress 0.55 `
+  --auto-unfreeze-patience 3 --auto-unfreeze-steps 180 --auto-unfreeze-penalty-scale 0.55 --auto-unfreeze-eps-boost 0.24 `
+  --search-preset balanced `
+  --save-every 500 --quiet-sim --quiet-eval --in-memory-log `
+  --warm_start_cmaes --warm_start_path 01_pi_flight\results\best_program.json
+```
+
+可选：立即+1 段起步（帮助打破僵局）
+----------------------------------
+说明：起步直接 4 段，短期分数可能略降，但利于后续探索。
+```powershell
+& .\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 14000 `
+  --traj_list zigzag3d lemniscate3d random_wp spiral_in_out stairs coupled_surface `
+  --aggregate harmonic --duration 20 --disturbance mild_wind --log-skip 2 `
+  --compose-by-gain --clip-D 1.2 `
+  --traj-batch-size 3 `
+  --parallel-traj --num-workers 0 `
+  --mini-full-every 5 --mini-full-frac 0.5 `
+  --verify-best-every 10 --verify-start-iter 10 `
+  --min-rules-guard 4 --pad-after-warm-start `
+  --prefer-more-rules-tie-delta 0.03 `
+  --allowed-cond-unaries identity,abs,sin,cos --trig-as-phase-window --trig-lt-max 0.20 `
+  --structure-burst-patience 150 --structure-burst-steps 200 --structure-burst-min-rules 5 --structure-burst-add-bias 6 --structure-burst-prefer-more-delta 0.05 `
+  --search-preset balanced `
+  --save-every 500 --quiet-sim --quiet-eval --in-memory-log `
+  --warm_start_cmaes --warm_start_path 01_pi_flight\results\best_program.json
+```
+
+二、标准化验证（写回 verified_score）
+----------------------------------
+训练集验证 (test_challenge):
+PI-Light：
+```powershell
+& .\.venv\Scripts\python.exe utilities\verify_program.py `
+  --program 01_pi_flight\results\best_program.json `
+  --traj_preset test_challenge `
+  --aggregate harmonic `
+  --disturbance mild_wind `
+  --duration 20 `
+  --log-skip 2 `
+  --clip-D 1.2 `
+  --compose-by-gain `
+  --inplace
+```
+CMA-ES：
+```powershell
+& .\.venv\Scripts\python.exe utilities\verify_program.py `
+  --program 03_CMA-ES\results\best_program.json `
+  --traj_preset test_challenge `
+  --aggregate harmonic `
+  --disturbance mild_wind `
+  --duration 20 `
+  --log-skip 2 `
+  --clip-D 1.2 `
+  --compose-by-gain `
+  --inplace
+```
+
+测试集验证 (test_extreme - 极端参数，测试泛化能力):
+PI-Light：
+```powershell
+& .\.venv\Scripts\python.exe utilities\verify_program.py `
+  --program 01_pi_flight\results\best_program.json `
+  --traj_preset test_extreme `
+  --aggregate harmonic `
+  --disturbance mild_wind `
+  --duration 20 `
+  --log-skip 2 `
+  --clip-D 1.2 `
+  --compose-by-gain `
+  --inplace
+```
+CMA-ES基线：
+```powershell
+& .\.venv\Scripts\python.exe utilities\verify_program.py `
+  --program 03_CMA-ES\results\best_program.json `
+  --traj_preset test_extreme `
+  --aggregate harmonic `
+  --disturbance mild_wind `
+  --duration 20 `
+  --log-skip 2 `
+  --clip-D 1.2 `
+  --compose-by-gain `
+  --inplace
+```
+(基线: 训练3.4204 → 测试3.2455, 泛化损失5.1%)
+  
+  
+- 训练脚本已在“进入循环前”对热启动程序做一次全轨迹+全时长全评种子（InitVerify），因此并行/非并行的第 1 行 `best_full_reward` 一致（≈3.4467），`program_size` 为 3。
+  CMA-ES：
+  ```powershell
+  & .\.venv\Scripts\python.exe utilities\verify_program.py `
+    --program 03_CMA-ES\results\best_program.json `
+    --traj_preset test_challenge `
+    --aggregate harmonic `
+    --disturbance mild_wind `
+    --duration 20 `
+    --log-skip 2 `
+    --clip-D 0 `
+    --compose-by-gain `
+    --inplace
+  ```
+
+  快捷：一键标准验证脚本（推荐）
+  ----------------------------------
+  为避免口径偏差，已添加脚本封装统一参数：
+
+  - 单文件验证（默认写回 inplace）：
+    ```powershell
+  .\scripts\verify_standard.ps1 -Program "01_pi_flight\results\best_program.json"
+    .\scripts\verify_standard.ps1 -Program "03_CMA-ES\results\best_program.json"
+    ```
+  - 同时验证 CMA-ES 与 PI-Light：
+    ```powershell
+    .\scripts\verify_both_standard.ps1
+    ```
+
+  脚本所用口径完全等同于上方命令：
+  test_challenge + harmonic + mild_wind + duration=20 + log-skip=2 + clip-D=1.2 + compose-by-gain。
+
+  可选：CMA-ES 训练
+  ```powershell
+  & .\.venv\Scripts\python.exe 03_CMA-ES\cma_pid_search.py `
+    --iters 20 `
+    --popsize 8 `
+    --traj_preset train_core `
+    --aggregate harmonic `
+    --disturbance mild_wind `
+    --output 03_CMA-ES\results\best_program.json
+  ```
+
+  说明
+  - 训练脚本已在进入循环前对热启动程序做一次全轨迹+全时长全评种子（InitVerify），因此并行/非并行的第 1 行 best_full_reward 一致（≈3.4467），program_size 为 3。
+  - 并行需成对使用：--parallel-traj 与 --num-workers；其中 --num-workers 0 表示自动（CPU 逻辑核数-1）。
+  - 想更快：可减小 --traj-batch-size 或降低 --mini-full-every 频率；想更多结构：启用上面的“促分支”方案或延长探索期。
+  - 需要极静音可加 --deep-quiet；Windows 下并行使用 spawn，若遇到开销偏大可先关并行做节奏基准。
+  --search-preset balanced `
+
+  --parallel-traj `
+
+  --save-every 500 --quiet-sim --quiet-eval --in-memory-log `
+
+  --warm_start_cmaes --warm_start_path 01_pi_flight\results\best_program.json
+
+
+
+
+
+
+.\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 700 `
+  --traj_preset pi_strong_train `
+  --short-duration 10 `
+  --full-duration 20 `
+  --short-frac 0.6 `
+  --traj-batch-size 0 `
+  --verify-best-every 30 `
+  --verify-start-iter 200 `
+  --gate-start-iter 200 `
+  --allowed-cond-unaries 'identity,abs,sin,cos' `
+  --trig-as-phase-window `
+  --trig-lt-max 0.15 `
+  --strict-bonus-scale 0.05 `
+  --compose-by-gain `
+  --epsilon-max 0.32 `
+  --epsilon-end-progress 0.60 `
+  --add-rule-bias-base 5 `
+  --min-rules-guard 5 `
+  --min-rules-final 8 `
+  --min-rules-ramp-start 0.25 `
+  --min-rules-ramp-end 0.65 `
+  --prefer-more-rules-tie-delta 0.10 `
+  --max-rules 16 `
+  --structure-burst-patience 25 `
+  --structure-burst-steps 60 `
+  --structure-burst-min-rules 7 `
+  --structure-burst-add-bias 5 `
+  --structure-burst-prefer-more-delta 0.10 `
+  --quiet-sim `
+  --overlap-penalty 0.03 --conflict-penalty 0.015 `
+  --parallel-traj `
+  --num-workers 0 `
+  --in-memory-log `
+  --quiet-eval `
+  --warm_start_cmaes --warm_start_path 01_pi_flight\results\best_program.json `
+    --semantics blend_topk `
+  --blend-topk-k 2 `
+  --require-k 2
+
+三、第二步：开启宏动作 + Bandit（建议）
+----------------------------------
+说明：若 blend_topk 收益有限，可在保持其他拨杆不变的前提下，开启宏动作（更大步的结构/增益联动编辑）与编辑类型 Bandit（UCB）信用，提升“有效动作”的命中率与分支速度。
+
+推荐命令（在 PowerShell 中执行）：
+```powershell
+& .\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 700 `
+  --traj_preset pi_strong_train `
+  --short-duration 10 `
+  --full-duration 20 `
+  --short-frac 0.6 `
+  --traj-batch-size 0 `
+  --verify-best-every 30 `
+  --verify-start-iter 200 `
+  --gate-start-iter 200 `
+  --allowed-cond-unaries identity,abs,sin,cos `
+  --trig-as-phase-window `
+  --trig-lt-max 0.15 `
+  --strict-bonus-scale 0.05 `
+  --compose-by-gain `
+  --full-action-prob 0.55 `
+  --epsilon-max 0.32 `
+  --epsilon-end-progress 0.60 `
+  --add-rule-bias-base 5 `
+  --min-rules-guard 5 `
+  --min-rules-final 8 `
+  --min-rules-ramp-start 0.25 `
+  --min-rules-ramp-end 0.65 `
+  --prefer-more-rules-tie-delta 0.10 `
+  --max-rules 16 `
+  --structure-burst-patience 25 `
+  --structure-burst-steps 60 `
+  --structure-burst-min-rules 7 `
+  --structure-burst-add-bias 5 `
+  --structure-burst-prefer-more-delta 0.10 `
+  --quiet-sim `
+  --overlap-penalty 0.03 --conflict-penalty 0.015 `
+  --parallel-traj `
+  --num-workers 0 `
+  --in-memory-log `
+  --quiet-eval `
+  --warm_start_cmaes --warm_start_path 01_pi_flight\results\best_program.json `
+  --enable-macros `
+  --edit-credit ucb --edit-credit-c 0.9
+```
+
+提示：
+- 若仍久未分支，可临时将 `--prefer-more-rules-tie-delta` 调到 0.12~0.15；或把 `--structure-burst-patience` 降到 18~20。
+- 也可把 `--semantics` 切回 `compose_by_gain`（不加该参数即为 compose），或在 blend_topk 下把 `--require-k` 从 2 降到 1 以提升触发概率。
+
+
+
+& .\.venv\Scripts\python.exe 01_pi_flight\train_pi_flight.py `
+  --iters 10000 `
+  --traj_list zigzag3d lemniscate3d random_wp spiral_in_out stairs coupled_surface `
+  --aggregate harmonic `
+  --disturbance mild_wind `
+  --duration 20 `
+  --log-skip 2 `
+  --compose-by-gain `
+  --clip-D 1.2 `
+  --parallel-traj --num-workers 0 `
+  --traj-batch-size 0 `
+  --enable-macros `
+  --edit-credit ucb --edit-credit-c 0.9 `
+  --allowed-cond-unaries identity,abs,sin,cos `
+  --trig-as-phase-window `
+  --trig-lt-max 0.20 `
+  --max-rules 12 `
+  --prefer-more-rules-tie-delta 0.04 `
+  --add-rule-bias-base 5 `
+  --min-rules-guard 4 `
+  --min-rules-final 8 `
+  --min-rules-ramp-start 0.25 `
+  --min-rules-ramp-end 0.65 `
+  --overlap-penalty 0.03 `
+  --conflict-penalty 0.015 `
+  --short-duration 10 `
+  --full-duration 20 `
+  --short-frac 0.2 `
+  --mini-full-every 8 `
+  --mini-full-frac 0.5 `
+  --verify-best-every 16 `
+  --verify-start-iter 32 `
+  --no-gate-on-short-best `
+  --stagnation-seconds 300 `
+  --epsilon-rebound-target 0.22 `
+  --time-rebound-iters 120 `
+  --rebound-decay-iters 80 `
+  --rebound-target-eps 0.12 `
+  --auto-unfreeze-patience 4 `
+  --auto-unfreeze-steps 120 `
+  --auto-unfreeze-penalty-scale 0.6 `
+  --auto-unfreeze-eps-boost 0.18 `
+  --structure-burst-patience 110 `
+  --structure-burst-steps 40 `
+  --structure-burst-min-rules 5 `
+  --structure-burst-add-bias 6 `
+  --structure-burst-prefer-more-delta 0.05 `
+  --search-preset balanced `
+  --alt-opt-every 60 `
+  --alt-opt-steps 24 `
+  --save-every 200 `
+  --iter-log-file 01_pi_flight\results\iter_log_10k.csv `
+  --quiet-sim --quiet-eval --in-memory-log `
+  --warm_start_cmaes `
+  --warm_start_path 01_pi_flight\results\best_program.json
