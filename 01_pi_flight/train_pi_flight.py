@@ -93,26 +93,6 @@ except Exception as _te:
     raise ImportError(f"Failed to import local SimulationTester from test.py: {_te}")
 
 from utilities.reward_profiles import get_reward_profile, describe_profile
-# TrustRegionManager import compatible with both package and script modes
-# LAZY IMPORT: defer to avoid circular import / module initialization deadlock
-TrustRegionManager = None  # type: ignore
-def _get_trust_region_manager():
-    global TrustRegionManager
-    if TrustRegionManager is not None:
-        return TrustRegionManager
-    try:
-        if __package__:
-            from .trust_region import TrustRegionManager as TRM  # type: ignore
-        else:
-            raise ImportError
-    except Exception:
-        try:
-            import importlib as _il_tr
-            TRM = getattr(_il_tr.import_module(f"{_PKG_NAME}.trust_region"), 'TrustRegionManager')  # type: ignore
-        except Exception:
-            TRM = None  # type: ignore
-    TrustRegionManager = TRM
-    return TrustRegionManager
 
 def build_trajectory(name: str):
     if name == 'figure8':
