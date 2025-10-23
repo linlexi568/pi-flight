@@ -176,8 +176,8 @@ PI-Light：
   --program 01_pi_flight\results\best_program.json `
   --traj_preset test_challenge `
   --aggregate harmonic `
-  --disturbance mild_wind `
-  --duration 20 `
+  --disturbance stress `
+  --duration 25 `
   --log-skip 2 `
   --clip-D 1.2 `
   --compose-by-gain `
@@ -199,8 +199,17 @@ CMA-ES：
 
 测试集验证 (test_extreme - 极端参数，测试泛化能力):
 PI-Light：
-```powershell
-& C:/Users/56809/Desktop/pi-flight/.venv/Scripts/Activate.ps1; cd C:\Users\56809\Desktop\pi-flight; python utilities\verify_program.py --program "01_pi_flight\results\checkpoints\best_program_iter_002800.json" --traj_preset test_extreme --aggregate harmonic --disturbance stress --duration 25 --log-skip 2 --clip-D 1.2 --compose-by-gain --inplace
+```PowerShell
+& .\.venv\Scripts\python.exe utilities\verify_program.py `
+  --program 01_pi_flight\results\best_program.json `
+  --traj_preset test_extreme `
+  --aggregate harmonic `
+  --disturbance mild_wind `
+  --duration 20 `
+  --log-skip 2 `
+  --clip-D 1.2 `
+  --compose-by-gain `
+  --inplace
 ```
 CMA-ES基线：
 ```powershell
@@ -209,9 +218,9 @@ CMA-ES基线：
   --traj_preset test_extreme `
   --aggregate harmonic `
   --disturbance mild_wind `
-  --duration 25 `
+  --duration 20 `
   --log-skip 2 `
-  --clip-D 0 `
+  --clip-D 1.2 `
   --compose-by-gain `
   --inplace
 ```
