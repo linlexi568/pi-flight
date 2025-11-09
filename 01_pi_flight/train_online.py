@@ -45,15 +45,24 @@ from mcts_training.program_features import featurize_program
 # GNN相关模块（可选）
 try:
     from gnn_features import ast_to_pyg_graph, batch_programs_to_graphs
-    from gnn_policy_nn import GNNPolicyValueNet
+    from gnn_policy_nn import GNNPolicyValueNet as GNNPolicyValueNetV1
+    # v2 可选导入
+    try:
+        from gnn_policy_nn_v2 import create_gnn_policy_value_net_v2 as create_gnn_policy_value_net_v2
+        GNN_V2_AVAILABLE = True
+    except ImportError:
+        create_gnn_policy_value_net_v2 = None  # type: ignore
+        GNN_V2_AVAILABLE = False
     from torch_geometric.data import Batch as PyGBatch
     GNN_AVAILABLE = True
 except ImportError as e:
     print(f"[Warning] GNN模块不可用: {e}")
     GNN_AVAILABLE = False
+    GNN_V2_AVAILABLE = False
     ast_to_pyg_graph = None
     batch_programs_to_graphs = None
-    GNNPolicyValueNet = None
+    GNNPolicyValueNetV1 = None  # type: ignore
+    create_gnn_policy_value_net_v2 = None  # type: ignore
     PyGBatch = None
 
 # 导入batch_evaluation（可能需要Isaac Gym）；确保在导入 torch 之前尝试导入 isaacgym
@@ -79,6 +88,8 @@ class _DummyEvaluator:
         # 粗略按规则数给一点偏好，仍保留随机性，便于跑通流程
         base = float(len(program)) * 0.05
         return base + (self._rng.random() - 0.5) * 0.1
+    def evaluate_batch(self, programs: List[List[Dict[str, Any]]]):
+        return [self.evaluate_single(p) for p in programs]
 
 # 导入serialization
 try:
@@ -143,15 +154,33 @@ class OnlineTrainer:
         
         # 初始化NN（根据use_gnn选择模型）
         if self.use_gnn:
-            print(f"[Trainer] 使用 GNN 策略-价值网络")
-            self.nn_model = GNNPolicyValueNet(
-                node_feature_dim=24,
-                hidden_dim=args.nn_hidden,
-                num_layers=3,
-                num_heads=4,
-                policy_output_dim=len(EDIT_TYPES),
-                dropout=0.1
-            ).to(self.device)
+            # 选择版本
+            nn_version = getattr(args, 'nn_version', 'v1')
+            if nn_version == 'v2' and GNN_V2_AVAILABLE:
+                print(f"[Trainer] 使用 GNN v2 (Hierarchical Dual) 网络")
+                self.nn_model = create_gnn_policy_value_net_v2(
+                    node_feature_dim=24,
+                    policy_output_dim=len(EDIT_TYPES),
+                    structure_hidden=256,
+                    structure_layers=5,
+                    structure_heads=8,
+                    feature_layers=3,
+                    feature_heads=8,
+                    dropout=0.1
+                ).to(self.device)
+            else:
+                if nn_version == 'v2' and not GNN_V2_AVAILABLE:
+                    print("[Trainer] 请求 v2 但未找到模块，回退到 v1")
+                else:
+                    print(f"[Trainer] 使用 GNN v1 网络")
+                self.nn_model = GNNPolicyValueNetV1(
+                    node_feature_dim=24,
+                    hidden_dim=args.nn_hidden,
+                    num_layers=3,
+                    num_heads=4,
+                    policy_output_dim=len(EDIT_TYPES),
+                    dropout=0.1
+                ).to(self.device)
         else:
             print(f"[Trainer] 使用固定特征策略-价值网络")
             self.nn_model = PolicyValueNNLarge(
@@ -190,8 +219,15 @@ class OnlineTrainer:
         # 经验回放
         self.replay_buffer = ReplayBuffer(capacity=args.replay_capacity, use_gnn=self.use_gnn)
         
-        # 评估器：优先Isaac Gym；若不可用，用Dummy占位以跑通流程
-        if BatchEvaluator is not None:
+        # 评估器：支持强制使用 Dummy，用于快速A/B基准
+        force_dummy = getattr(args, 'use_dummy_eval', False)
+        if force_dummy or BatchEvaluator is None:
+            if not force_dummy:
+                print("[Trainer] 使用 DummyEvaluator（未检测到 Isaac Gym）")
+            else:
+                print("[Trainer] 强制使用 DummyEvaluator（A/B快速基准）")
+            self.evaluator = _DummyEvaluator()
+        else:
             self.evaluator = BatchEvaluator(
                 trajectory_config=self._build_trajectory(),
                 duration=args.duration,
@@ -204,9 +240,6 @@ class OnlineTrainer:
                 zero_action_penalty=1.5,
                 use_fast_path=getattr(args, 'use_fast_path', False)
             )
-        else:
-            print("[Trainer] 使用 DummyEvaluator（未检测到 Isaac Gym）")
-            self.evaluator = _DummyEvaluator()
         
         # 统计
         self.iteration = 0
@@ -718,6 +751,7 @@ def parse_args():
     
     # NN参数
     p.add_argument('--use-gnn', action='store_true', help='使用GNN网络（GAT）代替固定特征网络')
+    p.add_argument('--nn-version', type=str, default='v1', choices=['v1','v2'], help='GNN版本: v1(原始) 或 v2(分层双网络)')
     p.add_argument('--nn-hidden', type=int, default=256, help='NN隐藏层维度')
     p.add_argument('--learning-rate', type=float, default=1e-3, help='学习率')
     p.add_argument('--value-loss-weight', type=float, default=0.5, help='价值损失权重')
@@ -736,6 +770,7 @@ def parse_args():
     p.add_argument('--min-steps-frac', type=float, default=0.0, help='每次评估至少执行的步数比例 [0,1]，避免过早 done 退出')
     p.add_argument('--reward-reduction', type=str, default='sum', choices=['sum','mean'], help="奖励归约方式：'sum'（步次求和）或 'mean'（步次平均）")
     p.add_argument('--use-fast-path', action='store_true', help='启用超高性能优化路径（环境池复用+Numba JIT编译，7×加速）')
+    p.add_argument('--use-dummy-eval', action='store_true', help='强制使用Dummy评估器（禁用Isaac Gym），用于快速A/B基准')
     
     # 保存参数
     p.add_argument('--save-path', type=str, default='01_pi_flight/results/online_best_program.json')
