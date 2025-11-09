@@ -14,13 +14,19 @@ from .dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 # Stable import for segmented controller
 from .segmented_controller import PiLightSegmentedPIDController
 
-# Try new split path first, then legacy fallback
-try:
-    from .mcts_training.mcts import MCTS_Agent  # type: ignore
-except Exception:
-    from .mcts import MCTS_Agent  # type: ignore
+# 为了兼容 Python 3.8（避免在导入时触发不兼容的类型注解），延迟导入 MCTS_Agent。
+def _load_mcts_agent():
+    try:
+        from .mcts_training.mcts import MCTS_Agent  # type: ignore
+        return MCTS_Agent
+    except Exception:
+        try:
+            from .mcts import MCTS_Agent  # type: ignore
+            return MCTS_Agent
+        except Exception as e:
+            raise ImportError(f"Unable to load MCTS_Agent: {e}")
 
 __all__ = [
     'ProgramNode','TerminalNode','UnaryOpNode','BinaryOpNode','IfNode',
-    'MCTS_Agent','PiLightSegmentedPIDController'
+    'PiLightSegmentedPIDController','_load_mcts_agent'
 ]

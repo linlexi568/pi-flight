@@ -1,24 +1,24 @@
 # Copied from 01_pi_light/segmented_controller.py for package rename
-from typing import Dict, Any, Callable, List
+from typing import Dict, Any, Callable, List, Union, Tuple
 import numpy as np
 from scipy.spatial.transform import Rotation
-from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
-from gym_pybullet_drones.utils.enums import DroneModel
+from .local_pid import SimplePIDControl as DSLPIDControl
+from .local_pid import LocalDroneModel as DroneModel
 from .dsl import ProgramNode, UnaryOpNode, BinaryOpNode, TerminalNode, IfNode
 
 class PiLightSegmentedPIDController(DSLPIDControl):
     def __init__(self,
-                 drone_model: DroneModel,
-                 program: List[Dict[str, Any]],
+                 drone_model: Union[DroneModel, str] = "cf2x",
+                 program: List[Dict[str, Any]] = None,
                  suppress_init_print: bool=False,
                  compose_by_gain: bool=False,
-                 clip_P: float | None=None,
-                 clip_I: float | None=None,
-                 clip_D: float | None=None,
-                 semantics: str | None = None,
+                 clip_P: Union[float, None]=None,
+                 clip_I: Union[float, None]=None,
+                 clip_D: Union[float, None]=None,
+                 semantics: Union[str, None] = None,
                  require_k: int = 0,
                  blend_topk_k: int = 2,
-                 gain_slew_limit: float | list[float] | tuple[float, ...] | None = None,
+                 gain_slew_limit: Union[float, List[float], Tuple[float, ...], None] = None,
                  min_hold_steps: int = 0):
         super().__init__(drone_model=drone_model)
         self.segments=[]; self._segment_hit_counter={}

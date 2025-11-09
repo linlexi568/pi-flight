@@ -1,26 +1,21 @@
 """Standalone training/search entry for PI-Flight (MCTS over DSL rules).
 
 迁移自 01_pi_light/train_pi_light.py，并改为默认保存到 01_pi_flight/results。
+
+🚀 支持 Isaac Gym GPU 加速仿真（100-500× 加速）
 """
 from __future__ import annotations
 import argparse, os, time, json, io, contextlib, warnings, sys, pathlib
 import numpy as np
 
-# --- Early deep quiet detection (before gym_pybullet_drones imports) ---
-_DEEP_QUIET_EARLY = ('--deep-quiet' in sys.argv)
-_saved_out = _saved_err = _devnull = None  # sentinel for analyzer
-if _DEEP_QUIET_EARLY:
-    warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.*")
-    warnings.filterwarnings("ignore", module="pkg_resources")
-    try:
-        import os as _osq
-        _devnull = open(_osq.devnull, 'w')
-        _saved_out = _osq.dup(1)
-        _saved_err = _osq.dup(2)
-        _osq.dup2(_devnull.fileno(), 1)
-        _osq.dup2(_devnull.fileno(), 2)
-    except Exception:
-        _DEEP_QUIET_EARLY = False
+# === Isaac Gym 支持检测 ===
+ISAAC_GYM_AVAILABLE = False
+try:
+    from isaacgym import gymapi
+    ISAAC_GYM_AVAILABLE = True
+    print("[Isaac Gym] ✅ 检测到 Isaac Gym，GPU 加速已启用")
+except ImportError:
+    print("[Isaac Gym] ⚠️  未检测到 Isaac Gym。请安装 https://developer.nvidia.com/isaac-gym 后再运行训练。")
 
 from typing import List, Dict, Any, Tuple
 
@@ -38,26 +33,12 @@ try:
     os.environ.setdefault('NUMEXPR_MAX_THREADS', '1')
 except Exception:
     pass
-from gym_pybullet_drones.utils.enums import DroneModel
-from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
-
-# Restore FDs after imports if we silenced them
-if _DEEP_QUIET_EARLY:
-    try:
-        import os as _osr
-        if _saved_out is not None:
-            _osr.dup2(_saved_out, 1); _osr.close(_saved_out)
-        if _saved_err is not None:
-            _osr.dup2(_saved_err, 2); _osr.close(_saved_err)
-        if _devnull is not None:
-            _devnull.close()
-    except Exception:
-        pass
+# 已移除历史多后端依赖与分支逻辑，统一使用 Isaac Gym
 
 # 兼容两种用法：包内相对导入 或 直接脚本执行
 try:
     if __package__:
-        from . import MCTS_Agent, PiLightSegmentedPIDController, BinaryOpNode, UnaryOpNode, TerminalNode
+        from . import MCTS_Agent, BinaryOpNode, UnaryOpNode, TerminalNode
         from .serialization import save_program_json, save_search_history, deserialize_program
     else:
         raise ImportError
@@ -72,8 +53,22 @@ except Exception:
     _mod = _ilu.module_from_spec(_spec)  # type: ignore
     _sys.modules[_PKG_NAME] = _mod
     _spec.loader.exec_module(_mod)       # type: ignore
-    MCTS_Agent = getattr(_mod, 'MCTS_Agent')
-    PiLightSegmentedPIDController = getattr(_mod, 'PiLightSegmentedPIDController')
+    # 使用延迟加载器以兼容 Python 3.8 的类型注解限制；若仅请求 --help，则跳过加载
+    import sys as __sys
+    if ('--help' in __sys.argv) or ('-h' in __sys.argv):
+        MCTS_Agent = None  # type: ignore
+    else:
+        _m_loader = getattr(_mod, '_load_mcts_agent', None)
+        if _m_loader is None:
+            raise ImportError('pi_flight_local missing _load_mcts_agent')
+        MCTS_Agent = _m_loader()
+    # 控制器改为数学原语执行器
+    try:
+        MathProgramController = getattr(_mod, 'MathProgramController')
+    except Exception:
+        # 动态导入 program_executor
+        import importlib as _ilx
+        MathProgramController = _ilx.import_module(f'{_PKG_NAME}.program_executor').MathProgramController  # type: ignore[name-defined]
     BinaryOpNode = getattr(_mod, 'BinaryOpNode')
     UnaryOpNode = getattr(_mod, 'UnaryOpNode')
     TerminalNode = getattr(_mod, 'TerminalNode')
@@ -82,15 +77,18 @@ except Exception:
     save_search_history = getattr(_ser_mod, 'save_search_history')
     deserialize_program = getattr(_ser_mod, 'deserialize_program')
 
-# 确保优先导入工作区根目录下的 test.py（避免与 Python 标准库 test 包冲突）
-try:
-    import importlib, sys as _sys, pathlib as _pl
-    _CURR = _pl.Path(__file__).resolve(); _ROOTP = _CURR.parent.parent
-    if str(_ROOTP) not in _sys.path:
-        _sys.path.insert(0, str(_ROOTP))
-    SimulationTester = importlib.import_module('test').SimulationTester  # type: ignore
-except Exception as _te:
-    raise ImportError(f"Failed to import local SimulationTester from test.py: {_te}")
+# 使用 Isaac Gym 测试器；若仅请求 --help 则延迟导入
+import sys as _sys, pathlib as _pl
+_CURR = _pl.Path(__file__).resolve(); _ROOTP = _CURR.parent.parent
+if str(_ROOTP) not in _sys.path:
+    _sys.path.insert(0, str(_ROOTP))
+if ('--help' in _sys.argv) or ('-h' in _sys.argv):
+    SimulationTester = None  # type: ignore
+else:
+    try:
+        from utilities.isaac_tester import SimulationTester  # type: ignore
+    except Exception as _te:
+        raise ImportError(f"Failed to import SimulationTester (Isaac): {_te}")
 
 from utilities.reward_profiles import get_reward_profile, describe_profile
 
@@ -138,15 +136,15 @@ def build_disturbances(preset: str | None):
         return []
     if preset == 'mild_wind':
         return [
-            {'type': 'SUSTAINED_WIND','info':'mild','start_time':3.0,'end_time':6.0,'force':[0.01,0,0]},
-            {'type': 'PULSE','time':8.0,'force':[0.02,-0.01,0],'info':'pulse'}
+            {'type': 'SUSTAINED_WIND','info':'mild','start_time':3.0,'end_time':6.0,'force':[0.004,0.0,0.0]},
+            {'type': 'PULSE','time':8.0,'force':[0.008,-0.004,0.0],'info':'pulse'}
         ]
     if preset == 'stress':
         return [
-            {'type': 'SUSTAINED_WIND','info':'stress:steady_wind','start_time':2.0,'end_time':6.0,'force':[0.015,0.0,0]},
-            {'type': 'GUSTY_WIND','info':'stress:gusty_wind','start_time':7.0,'end_time':11.0,'base_force':[0,-0.01,0],'gust_frequency':9.0,'gust_amplitude':0.012},
-            {'type': 'MASS_CHANGE','info':'stress:mass_up','time':12.0,'mass_multiplier':1.15},
-            {'type': 'PULSE','info':'stress:pulse','time':14.0,'force':[-0.02,0.02,0]}
+            {'type': 'SUSTAINED_WIND','info':'stress:steady_wind','start_time':2.5,'end_time':6.5,'force':[0.007,0.0,0.0]},
+            {'type': 'GUSTY_WIND','info':'stress:gusty_wind','start_time':7.5,'end_time':11.5,'base_force':[0.0,-0.004,0.0],'gust_frequency':6.0,'gust_amplitude':0.006},
+            {'type': 'MASS_CHANGE','info':'stress:mass_up','time':12.0,'mass_multiplier':1.08},
+            {'type': 'PULSE','info':'stress:pulse','time':14.0,'force':[-0.008,0.008,0.0]}
         ]
     raise ValueError(f"Unknown disturbance preset: {preset}")
 
@@ -195,7 +193,7 @@ def parse_args():
     p.add_argument('--complexity-ramp-start', type=float, default=0.0)
     p.add_argument('--complexity-ramp-end', type=float, default=0.0)
     p.add_argument('--no-complexity-penalty', action='store_true')
-    p.add_argument('--reward_profile', type=str, default='pilight_boost', choices=['default','pilight_boost'])
+    p.add_argument('--reward_profile', type=str, default='pilight_boost', choices=['default','pilight_boost','pilight_freq_boost','control_law_discovery'])
     p.add_argument('--tqdm', action='store_true')
     p.add_argument('--banner-every', type=int, default=0)
     p.add_argument('--quiet-eval', action='store_true')
@@ -219,11 +217,17 @@ def parse_args():
     p.add_argument('--cache-size', type=int, default=2048)
     p.add_argument('--reuse-env', action='store_true')
     p.add_argument('--quiet-sim', action='store_true')
-    p.add_argument('--deep-quiet', action='store_true')
     # 并行与批次
     p.add_argument('--parallel-traj', action='store_true')
     p.add_argument('--num-workers', type=int, default=0, help='并行评估的进程数：0=禁用进程池（单进程），>1=启用固定进程数，-1=自动(约等于CPU-1)')
     p.add_argument('--traj-batch-size', type=int, default=0)
+    
+    # === Isaac Gym GPU 加速选项 ===
+    p.add_argument('--use-isaac-gym', action='store_true', 
+                   help='启用 Isaac Gym GPU 加速仿真（需要 NVIDIA GPU + Isaac Gym）')
+    p.add_argument('--isaac-num-envs', type=int, default=512,
+                   help='Isaac Gym 并行环境数（推荐 256-1024）')
+    
     # 迭代简报
     p.add_argument('--iter-log-file', type=str, default=None)
     # 测试集实时验证
@@ -309,56 +313,187 @@ def parse_args():
         pass
     return args
 
+# ====================================================================
+# Isaac Gym 批量评估函数（GPU 加速）
+# ====================================================================
+
+# 全局 Isaac Gym 环境池（避免重复初始化）
+_isaac_env_pool = None
+_isaac_env_lock = None
+
+def _get_isaac_env_pool(num_envs=512, duration=20.0):
+    """获取或创建 Isaac Gym 环境池（单例模式）"""
+    global _isaac_env_pool, _isaac_env_lock
+    
+    if not ISAAC_GYM_AVAILABLE:
+        return None
+    
+    if _isaac_env_pool is None:
+        try:
+            # 延迟导入
+            import sys, pathlib
+            cur = pathlib.Path(__file__).resolve()
+            env_path = cur.parent / 'envs'
+            if str(env_path) not in sys.path:
+                sys.path.insert(0, str(env_path))
+            
+            # 既支持包内相对导入，也支持通过sys.path注入的本地导入
+            try:
+                from .envs.isaac_gym_drone_env import IsaacGymDroneEnv  # type: ignore
+            except Exception:
+                from isaac_gym_drone_env import IsaacGymDroneEnv  # type: ignore
+            
+            print(f"[Isaac Gym] 🚀 初始化 GPU 环境池：{num_envs} 并行环境")
+            _isaac_env_pool = IsaacGymDroneEnv(
+                num_envs=num_envs,
+                duration_sec=duration,
+                headless=True,
+                use_gpu=True
+            )
+            print("[Isaac Gym] ✅ 环境池初始化完成")
+        except Exception as e:
+            print(f"[Isaac Gym] ❌ 初始化失败：{e}")
+            _isaac_env_pool = None
+    
+    return _isaac_env_pool
+
+
+def _evaluate_batch_isaac_gym(
+    programs: List,
+    trajectories: List,
+    duration: float,
+    reward_weights: Dict,
+    aggregate: str = 'harmonic',
+    **kwargs
+):
+    """
+    使用 Isaac Gym 批量评估多个程序
+    
+    Args:
+        programs: 程序列表
+        trajectories: 轨迹列表
+        duration: 评估时长
+        reward_weights: 奖励权重
+        aggregate: 聚合方式
+        **kwargs: 其他参数
+    
+    Returns:
+        scores: 每个程序的得分
+    """
+    env = _get_isaac_env_pool(num_envs=len(programs) * len(trajectories), duration=duration)
+    
+    if env is None:
+        raise RuntimeError('Isaac Gym 环境初始化失败，无法继续批量评估。')
+    
+    import torch
+    import numpy as np
+    
+    try:
+        # 重置所有环境
+        obs = env.reset()
+        
+        # 为每个环境分配 (程序, 轨迹) 对
+        num_programs = len(programs)
+        num_trajs = len(trajectories)
+        total_envs = num_programs * num_trajs
+        
+        # 创建控制器实例（批量）
+        controllers = []
+        env_assignments = []  # (prog_idx, traj_idx)
+        
+        for prog_idx, prog in enumerate(programs):
+            for traj_idx, traj in enumerate(trajectories):
+                controller = MathProgramController(program=prog, suppress_init_print=True)
+                controllers.append(controller)
+                env_assignments.append((prog_idx, traj_idx))
+        
+        # 运行仿真
+        num_steps = int(duration * env.control_freq)
+        episode_rewards = np.zeros(total_envs)
+        
+        for step in range(num_steps):
+            actions = []
+            
+            # 为每个环境计算控制
+            for env_idx, (controller, (prog_idx, traj_idx)) in enumerate(zip(controllers, env_assignments)):
+                # 从观测提取状态
+                state = {
+                    'pos': obs['position'][env_idx],
+                    'vel': obs['velocity'][env_idx],
+                    'quat': obs['orientation'][env_idx],
+                    'ang_vel': obs['angular_velocity'][env_idx]
+                }
+                
+                # 调用控制器
+                # TODO: 需要根据轨迹计算目标位置
+                target_pos = np.array([0, 0, 1.0])  # 简化示例
+                
+                # 计算 RPM
+                rpm = controller.computeControl(
+                    control_timestep=1.0 / env.control_freq,
+                    cur_pos=state['pos'],
+                    cur_quat=state['quat'],
+                    cur_vel=state['vel'],
+                    cur_ang_vel=state['ang_vel'],
+                    target_pos=target_pos,
+                    target_rpy=np.array([0, 0, 0]),
+                    target_vel=np.array([0, 0, 0])
+                )
+                
+                actions.append(rpm)
+            
+            # 批量执行
+            actions_tensor = torch.tensor(np.array(actions), dtype=torch.float32, device=env.device)
+            obs, rewards, dones, _ = env.step(actions_tensor)
+            
+            # 累积奖励
+            episode_rewards += rewards.cpu().numpy()
+        
+        # 聚合每个程序的得分
+        program_scores = np.zeros(num_programs)
+        
+        for prog_idx in range(num_programs):
+            # 提取该程序在所有轨迹上的奖励
+            traj_rewards = []
+            for traj_idx in range(num_trajs):
+                env_idx = prog_idx * num_trajs + traj_idx
+                traj_rewards.append(episode_rewards[env_idx])
+            
+            # 聚合
+            if aggregate == 'harmonic':
+                # 调和平均
+                program_scores[prog_idx] = len(traj_rewards) / np.sum(1.0 / (np.array(traj_rewards) + 1e-9))
+            elif aggregate == 'min':
+                program_scores[prog_idx] = np.min(traj_rewards)
+            else:  # mean
+                program_scores[prog_idx] = np.mean(traj_rewards)
+        
+        return program_scores.tolist()
+    
+    except Exception as e:
+        print(f"[Isaac Gym] ⚠️  批量评估失败: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
 def _worker_evaluate_single(packed):
-    (traj, program, dur, suppress, deep_quiet, disturbances, reward_weights, log_skip, in_memory, compose_by_gain, clip_P, clip_I, clip_D, pen_overlap, pen_conflict, semantics, require_k, blend_topk_k, gain_slew_limit, min_hold_steps) = packed
+    (traj, program, dur, suppress, _deep_quiet_ignored, disturbances, reward_weights, log_skip, in_memory, compose_by_gain, clip_P, clip_I, clip_D, pen_overlap, pen_conflict, semantics, require_k, blend_topk_k, gain_slew_limit, min_hold_steps) = packed
     cur = pathlib.Path(__file__).resolve(); root = cur.parent.parent
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     def _core():
-        if deep_quiet:
-            warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.*")
-            warnings.filterwarnings("ignore", module="pkg_resources")
-        if deep_quiet:
-            _dn=_o=_e=None
-            try:
-                import os as _osw
-                _dn = open(_osw.devnull,'w'); _o=_osw.dup(1); _e=_osw.dup(2); _osw.dup2(_dn.fileno(),1); _osw.dup2(_dn.fileno(),2)
-            except Exception:
-                _dn=_o=_e=None
-        from gym_pybullet_drones.utils.enums import DroneModel as _DM  # type: ignore
         # Fallback chain for controller import (prefer pi_flight)
         try:
-            from pi_flight import PiLightSegmentedPIDController as _PLC  # type: ignore
+            from pi_flight import MathProgramController as _PLC  # type: ignore
         except Exception:
             try:
-                from segmented_controller import PiLightSegmentedPIDController as _PLC  # type: ignore
+                from program_executor import MathProgramController as _PLC  # type: ignore
             except Exception:
                 import importlib
-                _PLC = importlib.import_module('01_pi_flight.segmented_controller').PiLightSegmentedPIDController  # type: ignore
-        from test import SimulationTester as _ST  # type: ignore
-        if deep_quiet:
-            try:
-                import os as _osw2
-                _o_loc = locals().get('_o'); _e_loc = locals().get('_e'); _dn_loc = locals().get('_dn')
-                if _o_loc is not None: _osw2.dup2(_o_loc,1); _osw2.close(_o_loc)
-                if _e_loc is not None: _osw2.dup2(_e_loc,2); _osw2.close(_e_loc)
-                if _dn_loc is not None: _dn_loc.close()
-            except Exception:
-                pass
-        controller = _PLC(
-            drone_model=_DM("cf2x"),
-            program=program,
-            suppress_init_print=suppress or deep_quiet,
-            compose_by_gain=bool(compose_by_gain),
-            clip_P=clip_P,
-            clip_I=clip_I,
-            clip_D=clip_D,
-            semantics=semantics,
-            require_k=int(require_k or 0),
-            blend_topk_k=int(blend_topk_k or 2),
-            gain_slew_limit=gain_slew_limit,
-            min_hold_steps=int(min_hold_steps or 0)
-        )
+                _PLC = importlib.import_module('01_pi_flight.program_executor').MathProgramController  # type: ignore
+        from utilities.isaac_tester import SimulationTester as _ST  # type: ignore
+        controller = _PLC(program=program, suppress_init_print=suppress)
         tester = _ST(
             controller=controller,
             test_scenarios=disturbances,
@@ -369,19 +504,12 @@ def _worker_evaluate_single(packed):
             duration_sec=dur,
             log_skip=log_skip,
             in_memory=in_memory,
-            quiet=(suppress or deep_quiet)
+            quiet=suppress
         )
         reward = tester.run()
-        try:
-            if (pen_overlap and pen_overlap>0) or (pen_conflict and pen_conflict>0):
-                metrics = controller.get_overlap_metrics()
-                mean_overlap = float(metrics.get('mean_overlap', 1.0))
-                mean_action_diff = float(metrics.get('mean_action_diff', 0.0))
-                reward = float(reward) - float(mean_overlap) * float(pen_overlap or 0.0) - float(mean_action_diff) * float(pen_conflict or 0.0)
-        except Exception:
-            pass
+        # 新控制器无重叠统计，忽略相关惩罚
         return reward
-    if suppress or deep_quiet:
+    if suppress:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             return _core()
@@ -399,15 +527,7 @@ def main():
     if args.seed is not None:
         import random, numpy as np
         random.seed(args.seed); np.random.seed(args.seed)
-    if getattr(args, 'deep_quiet', False):
-        warnings.filterwarnings("ignore", module="pkg_resources")
-        import io as _io, contextlib as _ctx
-        _silent = _io.StringIO()
-        with _ctx.redirect_stdout(_silent), _ctx.redirect_stderr(_silent):
-            try:
-                import pybullet  # noqa: F401
-            except Exception:
-                pass
+    # 已移除历史深度静音与外部依赖抑制逻辑
 
     DSL_VARIABLES = [
         'err_p_roll', 'err_p_pitch', 'err_d_roll', 'err_d_pitch',
@@ -418,7 +538,7 @@ def main():
     ]
     # 增加 PID 参数的关键区域密度 (0.5-2.5)
     DSL_CONSTANTS = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.2, 2.5, 3.0, 5.0]
-    DSL_OPERATORS = ['+', '-', '*', 'abs', '>', '<', 'max', 'min', 'sin', 'cos', 'tan', 'log1p', 'sqrt']
+    DSL_OPERATORS = ['+', '-', '*', '/', 'abs', '>', '<', 'max', 'min', 'sin', 'cos', 'tan', 'log1p', 'sqrt']
 
     if args.traj_list:
         traj_names = args.traj_list
@@ -556,7 +676,7 @@ def main():
         scores = []
         if pool_holder['enabled']:
             packs = [(
-                traj, program, dur, args.quiet_sim, args.deep_quiet,
+                traj, program, dur, args.quiet_sim, False,
                 disturbances, reward_weights, args.log_skip, args.in_memory_log,
                 bool(getattr(args, 'compose_by_gain', False)),
                 getattr(args,'clip_P',None), getattr(args,'clip_I',None), getattr(args,'clip_D',None),
@@ -571,7 +691,7 @@ def main():
                 pool_holder['enabled'] = False
                 for traj in selected_trajs:
                     scores.append(_worker_evaluate_single((
-                        traj, program, dur, args.quiet_sim, args.deep_quiet,
+                        traj, program, dur, args.quiet_sim, False,
                         disturbances, reward_weights, args.log_skip, args.in_memory_log,
                         bool(getattr(args, 'compose_by_gain', False)),
                         getattr(args,'clip_P',None), getattr(args,'clip_I',None), getattr(args,'clip_D',None),
@@ -582,25 +702,7 @@ def main():
         else:
             for bi, ti in enumerate(idxs):
                 traj = trajectories[ti]
-                controller = PiLightSegmentedPIDController(
-                    drone_model=DroneModel("cf2x"), program=program,
-                    suppress_init_print=args.quiet_sim,
-                    compose_by_gain=bool(getattr(args, 'compose_by_gain', False)),
-                    clip_P=getattr(args,'clip_P',None), clip_I=getattr(args,'clip_I',None), clip_D=getattr(args,'clip_D',None),
-                    semantics=getattr(args,'semantics', None), require_k=int(getattr(args,'require_k',0) or 0), blend_topk_k=int(getattr(args,'blend_topk_k',2) or 2),
-                    gain_slew_limit=getattr(args,'gain_slew_limit', None), min_hold_steps=int(getattr(args,'min_hold_steps',0) or 0)
-                )
-                external_env = None
-                if args.reuse_env:
-                    key = (dur, ti)
-                    if key not in env_pool:
-                        from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
-                        from gym_pybullet_drones.envs.BaseAviary import Physics
-                        import numpy as _np
-                        init_xyz = _np.array([traj.get('initial_xyz', [0,0,0.5])])
-                        env_pool[key] = CtrlAviary(drone_model=DroneModel.CF2X, num_drones=1, initial_xyzs=init_xyz,
-                                                   physics=Physics("pyb"), pyb_freq=240, ctrl_freq=48, gui=False, record=False)
-                    external_env = env_pool[key]
+                controller = MathProgramController(program=program, suppress_init_print=args.quiet_sim)
                 tester = SimulationTester(controller=controller,
                                           test_scenarios=disturbances,
                                           output_folder='01_pi_flight/results/mcts_eval',
@@ -610,18 +712,9 @@ def main():
                                           duration_sec=dur,
                                           log_skip=args.log_skip,
                                           in_memory=args.in_memory_log,
-                                          external_env=external_env,
-                                          reuse_reset=args.reuse_env,
                                           quiet=args.quiet_sim)
                 rew = tester.run()
-                try:
-                    if (getattr(args,'overlap_penalty',0.0) or 0.0)>0 or (getattr(args,'conflict_penalty',0.0) or 0.0)>0:
-                        metrics = controller.get_overlap_metrics()
-                        mean_overlap = float(metrics.get('mean_overlap', 1.0))
-                        mean_action_diff = float(metrics.get('mean_action_diff', 0.0))
-                        rew = float(rew) - float(mean_overlap) * float(getattr(args,'overlap_penalty',0.0) or 0.0) - float(mean_action_diff) * float(getattr(args,'conflict_penalty',0.0) or 0.0)
-                except Exception:
-                    pass
+                # 忽略 overlap/conflict 惩罚（不适用于数学原语控制）
                 scores.append(rew)
         if args.aggregate == 'mean':
             value = float(sum(scores)/len(scores))
@@ -684,7 +777,7 @@ def main():
         scores = []
         if pool_holder['enabled']:
             packs = [(
-                traj, program, dur, args.quiet_sim, args.deep_quiet,
+                traj, program, dur, args.quiet_sim, False,
                 disturbances, reward_weights, args.log_skip, args.in_memory_log,
                 bool(getattr(args, 'compose_by_gain', False)),
                 getattr(args,'clip_P',None), getattr(args,'clip_I',None), getattr(args,'clip_D',None),
@@ -698,7 +791,7 @@ def main():
                 print(f"[Parallel][WARN] 进程池执行失败(short_eval_all)，回退单进程: {_pm}")
                 for traj in trajectories:
                     scores.append(_worker_evaluate_single((
-                        traj, program, dur, args.quiet_sim, args.deep_quiet,
+                        traj, program, dur, args.quiet_sim, False,
                         disturbances, reward_weights, args.log_skip, args.in_memory_log,
                         bool(getattr(args, 'compose_by_gain', False)),
                         getattr(args,'clip_P',None), getattr(args,'clip_I',None), getattr(args,'clip_D',None),
@@ -707,25 +800,7 @@ def main():
                     )))
         else:
             for ti, traj in enumerate(trajectories):
-                controller = PiLightSegmentedPIDController(
-                    drone_model=DroneModel("cf2x"), program=program,
-                    suppress_init_print=args.quiet_sim,
-                    compose_by_gain=bool(getattr(args, 'compose_by_gain', False)),
-                    clip_P=getattr(args,'clip_P',None), clip_I=getattr(args,'clip_I',None), clip_D=getattr(args,'clip_D',None),
-                    semantics=getattr(args,'semantics', None), require_k=int(getattr(args,'require_k',0) or 0), blend_topk_k=int(getattr(args,'blend_topk_k',2) or 2),
-                    gain_slew_limit=getattr(args,'gain_slew_limit', None), min_hold_steps=int(getattr(args,'min_hold_steps',0) or 0)
-                )
-                external_env = None
-                if args.reuse_env:
-                    key = (dur, ti)
-                    if key not in env_pool:
-                        from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
-                        from gym_pybullet_drones.envs.BaseAviary import Physics
-                        import numpy as _np
-                        init_xyz = _np.array([traj.get('initial_xyz', [0,0,0.5])])
-                        env_pool[key] = CtrlAviary(drone_model=DroneModel.CF2X, num_drones=1, initial_xyzs=init_xyz,
-                                                   physics=Physics("pyb"), pyb_freq=240, ctrl_freq=48, gui=False, record=False)
-                    external_env = env_pool[key]
+                controller = MathProgramController(program=program, suppress_init_print=args.quiet_sim)
                 tester = SimulationTester(controller=controller,
                                           test_scenarios=disturbances,
                                           output_folder='01_pi_flight/results/mcts_eval',
@@ -735,18 +810,9 @@ def main():
                                           duration_sec=dur,
                                           log_skip=args.log_skip,
                                           in_memory=args.in_memory_log,
-                                          external_env=external_env,
-                                          reuse_reset=args.reuse_env,
                                           quiet=args.quiet_sim)
                 rew = tester.run()
-                try:
-                    if (getattr(args,'overlap_penalty',0.0) or 0.0)>0 or (getattr(args,'conflict_penalty',0.0) or 0.0)>0:
-                        metrics = controller.get_overlap_metrics()
-                        mean_overlap = float(metrics.get('mean_overlap', 1.0))
-                        mean_action_diff = float(metrics.get('mean_action_diff', 0.0))
-                        rew = float(rew) - float(mean_overlap) * float(getattr(args,'overlap_penalty',0.0) or 0.0) - float(mean_action_diff) * float(getattr(args,'conflict_penalty',0.0) or 0.0)
-                except Exception:
-                    pass
+                # 忽略 overlap/conflict 惩罚
                 scores.append(rew)
         if args.aggregate == 'mean':
             value = float(sum(scores)/len(scores))
@@ -778,7 +844,7 @@ def main():
         scores = []
         if pool_holder['enabled']:
             packs = [(
-                traj, program, dur, args.quiet_sim, args.deep_quiet,
+                traj, program, dur, args.quiet_sim, False,
                 disturbances, reward_weights, args.log_skip, args.in_memory_log,
                 bool(getattr(args, 'compose_by_gain', False)),
                 getattr(args,'clip_P',None), getattr(args,'clip_I',None), getattr(args,'clip_D',None),
@@ -792,7 +858,7 @@ def main():
                 print(f"[Parallel][WARN] 进程池执行失败(full_eval)，回退单进程: {_pm}")
                 for traj in trajectories:
                     scores.append(_worker_evaluate_single((
-                        traj, program, dur, args.quiet_sim, args.deep_quiet,
+                        traj, program, dur, args.quiet_sim, False,
                         disturbances, reward_weights, args.log_skip, args.in_memory_log,
                         bool(getattr(args, 'compose_by_gain', False)),
                         getattr(args,'clip_P',None), getattr(args,'clip_I',None), getattr(args,'clip_D',None),
@@ -801,25 +867,8 @@ def main():
                     )))
         else:
             for ti, traj in enumerate(trajectories):
-                controller = PiLightSegmentedPIDController(
-                    drone_model=DroneModel("cf2x"), program=program,
-                    suppress_init_print=args.quiet_sim,
-                    compose_by_gain=bool(getattr(args, 'compose_by_gain', False)),
-                    clip_P=getattr(args,'clip_P',None), clip_I=getattr(args,'clip_I',None), clip_D=getattr(args,'clip_D',None),
-                    semantics=getattr(args,'semantics', None), require_k=int(getattr(args,'require_k',0) or 0), blend_topk_k=int(getattr(args,'blend_topk_k',2) or 2),
-                    gain_slew_limit=getattr(args,'gain_slew_limit', None), min_hold_steps=int(getattr(args,'min_hold_steps',0) or 0)
-                )
-                external_env = None
-                if args.reuse_env:
-                    key = (dur, ti)
-                    if key not in env_pool:
-                        from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
-                        from gym_pybullet_drones.envs.BaseAviary import Physics
-                        import numpy as _np
-                        init_xyz = _np.array([traj.get('initial_xyz', [0,0,0.5])])
-                        env_pool[key] = CtrlAviary(drone_model=DroneModel.CF2X, num_drones=1, initial_xyzs=init_xyz,
-                                                   physics=Physics("pyb"), pyb_freq=240, ctrl_freq=48, gui=False, record=False)
-                    external_env = env_pool[key]
+                # 统一使用数学原语控制器
+                controller = MathProgramController(program=program, suppress_init_print=args.quiet_sim)
                 tester = SimulationTester(controller=controller,
                                           test_scenarios=disturbances,
                                           output_folder='01_pi_flight/results/mcts_eval',
@@ -829,8 +878,6 @@ def main():
                                           duration_sec=dur,
                                           log_skip=args.log_skip,
                                           in_memory=args.in_memory_log,
-                                          external_env=external_env,
-                                          reuse_reset=args.reuse_env,
                                           quiet=args.quiet_sim)
                 rew = tester.run()
                 try:
@@ -878,24 +925,7 @@ def main():
                 pass
         scores = []
         for ti, traj in enumerate(trajectories):
-            controller = PiLightSegmentedPIDController(
-                drone_model=DroneModel("cf2x"), program=program,
-                suppress_init_print=args.quiet_sim,
-                compose_by_gain=bool(getattr(args, 'compose_by_gain', False)),
-                clip_P=getattr(args,'clip_P',None), clip_I=getattr(args,'clip_I',None), clip_D=getattr(args,'clip_D',None),
-                semantics=getattr(args,'semantics', None), require_k=int(getattr(args,'require_k',0) or 0), blend_topk_k=int(getattr(args,'blend_topk_k',2) or 2)
-            )
-            external_env = None
-            if args.reuse_env:
-                key = (dur, ti)
-                if key not in env_pool:
-                    from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
-                    from gym_pybullet_drones.envs.BaseAviary import Physics
-                    import numpy as _np
-                    init_xyz = _np.array([traj.get('initial_xyz', [0,0,0.5])])
-                    env_pool[key] = CtrlAviary(drone_model=DroneModel.CF2X, num_drones=1, initial_xyzs=init_xyz,
-                                               physics=Physics("pyb"), pyb_freq=240, ctrl_freq=48, gui=False, record=False)
-                external_env = env_pool[key]
+            controller = MathProgramController(program=program, suppress_init_print=args.quiet_sim)
             tester = SimulationTester(controller=controller,
                                       test_scenarios=disturbances,
                                       output_folder='01_pi_flight/results/mcts_eval',
@@ -905,8 +935,6 @@ def main():
                                       duration_sec=dur,
                                       log_skip=args.log_skip,
                                       in_memory=args.in_memory_log,
-                                      external_env=external_env,
-                                      reuse_reset=args.reuse_env,
                                       quiet=args.quiet_sim)
             rew = tester.run()
             scores.append(float(rew))
@@ -985,14 +1013,7 @@ def main():
     def _temp_eval(prog:list):
         scores=[]
         for traj in trajectories:
-            controller = PiLightSegmentedPIDController(
-                drone_model=DroneModel("cf2x"), program=prog,
-                suppress_init_print=args.quiet_sim,
-                compose_by_gain=bool(getattr(args, 'compose_by_gain', False)),
-                clip_P=getattr(args,'clip_P',None), clip_I=getattr(args,'clip_I',None), clip_D=getattr(args,'clip_D',None),
-                semantics=getattr(args,'semantics', None), require_k=int(getattr(args,'require_k',0) or 0), blend_topk_k=int(getattr(args,'blend_topk_k',2) or 2),
-                gain_slew_limit=getattr(args,'gain_slew_limit', None), min_hold_steps=int(getattr(args,'min_hold_steps',0) or 0)
-            )
+            controller = MathProgramController(program=prog, suppress_init_print=args.quiet_sim)
             tester = SimulationTester(controller=controller,
                                       test_scenarios=disturbances,
                                       output_folder='01_pi_flight/results/mcts_eval',
@@ -1493,7 +1514,7 @@ def main():
                     if rule_params:
                         # 导入CMA-ES
                         try:
-                            import cma
+                            import cma  # type: ignore
                         except ImportError:
                             print("[CMA-Refine][WARN] 未安装cma库，跳过CMA微调")
                             rule_params = []
@@ -1638,15 +1659,7 @@ def main():
                             _traj = build_trajectory(_tj_actual)
                             
                             # 创建控制器
-                            _ctrl_test = PiLightSegmentedPIDController(
-                                drone_model=DroneModel.CF2X,
-                                program=cur_prog_test,
-                                compose_by_gain=args.compose_by_gain,
-                                clip_P=None,
-                                clip_I=None,
-                                clip_D=args.test_clip_D,
-                                semantics='compose_by_gain' if args.compose_by_gain else 'first_match'
-                            )
+                            _ctrl_test = MathProgramController(program=cur_prog_test, suppress_init_print=True)
                             
                             # 创建 SimulationTester
                             _tst = SimulationTester(

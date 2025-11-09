@@ -93,10 +93,52 @@ _pilight_freq_boost_ks: Coeffs = {
     "k_high_freq": 3.0,  # 建议初值，可在未来外显为 CLI 参数
 }
 
+# 专门为控制律发现（符号策略综合）设计的 profile
+# 核心理念：相比轨迹跟踪DRL，控制律发现更关注鲁棒性和可解释性，
+#         而不是过拟合单条轨迹的精确RMSE
+_control_law_discovery_weights: Weights = {
+    # 降低位置RMSE权重，避免MCTS过度优化单一轨迹而牺牲泛化性
+    "position_rmse": 0.60,
+    # 强调鲁棒性指标（扰动后恢复速度）
+    "settling_time": 1.00,
+    # 中等关注控制代价（允许为鲁棒性付出一定代价）
+    "control_effort": 0.40,
+    # 高度重视平滑性（符号DSL程序应产生平滑增益切换）
+    "smoothness_jerk": 1.20,
+    # 核心鲁棒性指标：增益稳定性（避免振荡）
+    "gain_stability": 1.25,
+    # 严格惩罚饱和（饱和意味着控制律在极端情况下失效）
+    "saturation": 1.30,
+    # 重视峰值误差（体现扰动抑制能力）
+    "peak_error": 1.15,
+    # 轻度关注高频能量（避免物理不可实现的高频指令）
+    "high_freq": 0.80,
+}
+
+_control_law_discovery_ks: Coeffs = {
+    # 更宽容的位置误差 shaping（允许小误差波动）
+    "k_position": 0.8,
+    # 强调快速恢复
+    "k_settle": 1.3,
+    # 中等控制代价敏感度
+    "k_effort": 0.18,
+    # 严格的平滑性要求
+    "k_jerk": 0.70,
+    # 强惩罚增益振荡
+    "k_gain": 0.35,
+    # 极严格的饱和惩罚
+    "k_sat": 1.5,
+    # 强惩罚瞬态峰值
+    "k_peak": 2.0,
+    # 中等高频惩罚
+    "k_high_freq": 2.5,
+}
+
 PROFILES: Dict[str, Tuple[Weights, Coeffs]] = {
     "default": (_default_weights, _default_ks),
     "pilight_boost": (_pilight_boost_weights, _pilight_boost_ks),
     "pilight_freq_boost": (_pilight_freq_boost_weights, _pilight_freq_boost_ks),
+    "control_law_discovery": (_control_law_discovery_weights, _control_law_discovery_ks),
 }
 
 

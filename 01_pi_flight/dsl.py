@@ -46,6 +46,11 @@ class BinaryOpNode(ProgramNode):
         l=self.left.evaluate(sd); r=self.right.evaluate(sd)
         if self.op=='+': return l+r
         if self.op=='-': return l-r
+        if self.op=='/':
+            try:
+                return l/ (r if abs(r) > 1e-12 else (1e-12 if r>=0 else -1e-12))
+            except Exception:
+                return 0.0
         if self.op=='>': return 1.0 if l>r else 0.0
         if self.op=='<': return 1.0 if l<r else 0.0
         if self.op=='max': return max(l,r)

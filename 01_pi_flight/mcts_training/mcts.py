@@ -1,8 +1,16 @@
 import math, random, copy, hashlib
-from typing import List, Any, Dict, Optional, Tuple, Set, Callable
+from typing import List, Any, Dict, Optional, Tuple, Set, Callable, Union
 
 # Import DSL nodes from parent package
-from ..dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+try:
+    from ..dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+except Exception:
+    # Fallback for script mode
+    import sys, pathlib
+    _parent = pathlib.Path(__file__).resolve().parent.parent
+    if str(_parent) not in sys.path:
+        sys.path.insert(0, str(_parent))
+    from dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 
 class MCTSNode:
     """Tree node with progressive widening & action cache.
@@ -48,7 +56,7 @@ class MCTS_Agent:
                  pw_alpha: float = 0.6,
                  pw_c: float = 1.5,
                  transposition: bool = True,
-                 warm_start_program: list | None = None):
+                 warm_start_program: Optional[list] = None):
         self.evaluation_function = evaluation_function
         self.dsl_variables = dsl_variables
         self.dsl_constants = dsl_constants
@@ -179,7 +187,7 @@ class MCTS_Agent:
             self._global_best_reward = base_val
             self.root.visits = 1
             self.root.value_sum = base_val
-    def search(self, iterations:int, total_target:int|None=None):
+    def search(self, iterations:int, total_target: Optional[int] = None):
         for i in range(iterations):
             # 动态调度（若 total_target 提供）：前 30% 线性降 epsilon，复杂度惩罚后 50% 线性升
             if total_target:
@@ -458,8 +466,7 @@ class MCTS_Agent:
                     if weighted:
                         # Sample proportionally
                         s = sum(w for _, w in weighted)
-                        import random as _r
-                        r = _r.random() * s
+                        r = random.random() * s
                         cum = 0.0
                         chosen = weighted[0][0]
                         for ii, w in weighted:
@@ -688,7 +695,7 @@ class MCTS_Agent:
             if val>best:
                 best=val
         return best if best>-float('inf') else 0.0
-    def _backpropagate(self,node:MCTSNode|None,reward:float):
+    def _backpropagate(self,node: Optional[MCTSNode],reward:float):
         while node is not None:
             node.visits += 1
             node.value_sum += reward
@@ -707,7 +714,7 @@ class MCTS_Agent:
             pass
     def get_best_program(self):
         return self._global_best_program, self._global_best_reward
-    def set_verify_callback(self, cb: Callable[[list, float, int], Tuple[bool, Optional[float]]] | Callable[..., tuple] | None):
+    def set_verify_callback(self, cb: Optional[Union[Callable[[list, float, int], Tuple[bool, Optional[float]]], Callable[..., tuple]]]):
         """Set gating verify callback; any callable that returns (accepted:bool, full_reward:Optional[float]) is OK."""
         if cb is None:
             self.verify_callback = (lambda program, short_reward, iter_idx: (True, None))
@@ -771,8 +778,9 @@ class MCTS_Agent:
             condition_str=self._ast_to_str(rule['condition'])
             action_parts=[]
             for act in rule['action']:
-                if isinstance(act,BinaryOpNode) and act.op=='set' and isinstance(act.left,TerminalNode) and isinstance(act.right,TerminalNode):
-                    action_parts.append(f"{act.left.value} *= {act.right.value}")
+                if isinstance(act,BinaryOpNode) and act.op=='set' and isinstance(act.left,TerminalNode):
+                    rstr = self._ast_to_str(act.right) if hasattr(act, 'right') else '0'
+                    action_parts.append(f"{act.left.value} = {rstr}")
             action_str=", ".join(action_parts)
             rule_strings.append(f"  Rule {i}: IF ({condition_str}) THEN ({action_str})")
         return "\n"+"\n".join(rule_strings)
@@ -857,26 +865,51 @@ class MCTS_Agent:
                     cond.right = TerminalNode(round(float(T_new), 4))
                     program[idx]['condition'] = self._enforce_narrow_condition(cond)
         elif mutation_type == 'tweak_multiplier':
+            # 泛化为：微调动作表达式中的常数项
             idx = payload
             if 0 <= idx < len(program):
                 acts = program[idx]['action']
-                mult_nodes=[a for a in acts if isinstance(a,BinaryOpNode) and a.op=='set']
-                if mult_nodes:
-                    node = random.choice(mult_nodes)
-                    if isinstance(node.right,TerminalNode) and isinstance(node.right.value,(int,float)):
-                        noise=random.uniform(0.92,1.08)  # 收紧: 原 0.85-1.15
-                        node.right=TerminalNode(round(float(node.right.value)*noise,4))
+                const_nodes = []
+                def collect_consts(n: ProgramNode):
+                    if isinstance(n, TerminalNode) and isinstance(n.value, (int, float)):
+                        const_nodes.append(n)
+                    elif isinstance(n, UnaryOpNode):
+                        collect_consts(n.child)
+                    elif isinstance(n, BinaryOpNode):
+                        collect_consts(n.left); collect_consts(n.right)
+                for a in acts:
+                    if isinstance(a, BinaryOpNode) and a.op == 'set' and hasattr(a, 'right'):
+                        collect_consts(a.right)
+                if const_nodes:
+                    n = random.choice(const_nodes)
+                    try:
+                        noise = random.uniform(0.92, 1.08)
+                        n.value = round(float(n.value) * noise, 4)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
         elif mutation_type == 'micro_tweak':
-            # 更小步幅的增益微调，用于临界区抛光
+            # 更小步幅的常数微调
             idx = payload
             if 0 <= idx < len(program):
                 acts = program[idx]['action']
-                mult_nodes=[a for a in acts if isinstance(a,BinaryOpNode) and a.op=='set']
-                if mult_nodes:
-                    node = random.choice(mult_nodes)
-                    if isinstance(node.right,TerminalNode) and isinstance(node.right.value,(int,float)):
-                        noise=random.uniform(0.97,1.03)
-                        node.right=TerminalNode(round(float(node.right.value)*noise,4))
+                const_nodes = []
+                def collect_consts(n: ProgramNode):
+                    if isinstance(n, TerminalNode) and isinstance(n.value, (int, float)):
+                        const_nodes.append(n)
+                    elif isinstance(n, UnaryOpNode):
+                        collect_consts(n.child)
+                    elif isinstance(n, BinaryOpNode):
+                        collect_consts(n.left); collect_consts(n.right)
+                for a in acts:
+                    if isinstance(a, BinaryOpNode) and a.op == 'set' and hasattr(a, 'right'):
+                        collect_consts(a.right)
+                if const_nodes:
+                    n = random.choice(const_nodes)
+                    try:
+                        noise = random.uniform(0.97, 1.03)
+                        n.value = round(float(n.value) * noise, 4)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
         elif mutation_type == 'nudge_threshold':
             # 条件阈值的微幅调整，便于在边缘处找到增益
             idx = payload
@@ -896,12 +929,23 @@ class MCTS_Agent:
                 new_rule = {'condition': base['condition'], 'action': [a for a in base['action']]}
                 if random.random() < 0.6:
                     acts = new_rule['action']
-                    mult_nodes=[a for a in acts if isinstance(a,BinaryOpNode) and a.op=='set']
-                    if mult_nodes:
-                        node = random.choice(mult_nodes)
-                        if isinstance(node.right,TerminalNode) and isinstance(node.right.value,(int,float)):
-                            noise=random.uniform(0.8,1.25)
-                            node.right=TerminalNode(round(float(node.right.value)*noise,4))
+                    # 复制后对表达式中的常数做轻微抖动
+                    const_nodes = []
+                    def collect_consts(n: ProgramNode):
+                        if isinstance(n, TerminalNode) and isinstance(n.value, (int, float)):
+                            const_nodes.append(n)
+                        elif isinstance(n, UnaryOpNode):
+                            collect_consts(n.child)
+                        elif isinstance(n, BinaryOpNode):
+                            collect_consts(n.left); collect_consts(n.right)
+                    for a in acts:
+                        if isinstance(a, BinaryOpNode) and a.op == 'set' and hasattr(a, 'right'):
+                            collect_consts(a.right)
+                    for cn in const_nodes:
+                        try:
+                            cn.value = round(float(cn.value) * random.uniform(0.9, 1.15), 4)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
                 else:
                     new_rule['condition'] = self._generate_random_condition()
                 program.append(new_rule)
@@ -950,28 +994,24 @@ class MCTS_Agent:
                 program[i1], program[i2] = program[i2], program[i1]
         # --- Macro actions ---
         elif mutation_type == 'macro_triplet_tune':
+            # 数学原语模式：整体缩放该规则中动作表达式的常数
             idx = payload
             if 0 <= idx < len(program):
                 acts = program[idx].get('action', [])
-                # ensure P/I/D exist; if missing, add with mild defaults
-                def _get_or_add(gain_name: str):
-                    for a in acts:
-                        if isinstance(a, BinaryOpNode) and a.op == 'set' and isinstance(a.left, TerminalNode) and a.left.value == gain_name:
-                            return a
-                    import random as _r
-                    base = 1.0 if gain_name != 'P' else 1.2
-                    new = BinaryOpNode('set', TerminalNode(gain_name), TerminalNode(round(base * _r.uniform(0.8, 1.2), 4)))
-                    acts.append(new)
-                    return new
-                nP = _get_or_add('P'); nI = _get_or_add('I'); nD = _get_or_add('D')
-                import random as _r
-                shared = _r.uniform(0.92, 1.08)
-                def _jit():
-                    return _r.uniform(0.98, 1.02)
-                for node_set in (nP, nI, nD):
-                    if isinstance(node_set.right, TerminalNode) and isinstance(node_set.right.value, (int, float)):
-                        node_set.right = TerminalNode(round(float(node_set.right.value) * shared * _jit(), 4))
-                program[idx]['action'] = acts
+                scale = random.uniform(0.95, 1.05)
+                def scale_consts(n: ProgramNode):
+                    if isinstance(n, TerminalNode) and isinstance(n.value, (int, float)):
+                        try:
+                            n.value = round(float(n.value) * scale, 4)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    elif isinstance(n, UnaryOpNode):
+                        scale_consts(n.child)
+                    elif isinstance(n, BinaryOpNode):
+                        scale_consts(n.left); scale_consts(n.right)
+                for a in acts:
+                    if isinstance(a, BinaryOpNode) and a.op == 'set' and hasattr(a, 'right'):
+                        scale_consts(a.right)
         elif mutation_type == 'macro_refine_condition':
             idx = payload
             if 0 <= idx < len(program):
@@ -1238,22 +1278,36 @@ class MCTS_Agent:
         # 浅克隆 (AST 节点不可变使用即可)；动作/条件再利用引用足够
         return {'condition': rule['condition'], 'action': list(rule['action'])}
     def _generate_random_action(self)->list:
+        """生成数学原语动作，随机设置 1~2 个输出键，每个键的右值为表达式 AST。"""
         import random
-        # 若配置了完整动作概率，则按概率生成 P+I+D 同时设置
-        full_prob = float(getattr(self, '_full_action_prob', 0.0))
-        if full_prob > 0.0 and random.random() < full_prob:
-            chosen = ['P','I','D']
-        else:
-            num_settings=random.randint(1,2)
-            gains_pool=['P','I','D']; random.shuffle(gains_pool)
-            chosen=gains_pool[:num_settings]
-        action=[]
-        for g in chosen:
-            if g=='P': mult=random.uniform(0.6,2.5)
-            elif g=='I': mult=random.uniform(0.5,2.0)
-            else: mult=random.uniform(0.5,2.0)
-            action.append(BinaryOpNode('set', TerminalNode(g), TerminalNode(round(mult,4))) )
-        return action
+        output_keys = ['u_fz','u_tx','u_ty','u_tz']
+        k = random.randint(1, 2)
+        random.shuffle(output_keys)
+        chosen = output_keys[:k]
+        acts = []
+        for key in chosen:
+            expr = self._generate_random_expression()
+            acts.append(BinaryOpNode('set', TerminalNode(key), expr))
+        return acts
+
+    def _generate_random_expression(self, depth: int = 0, max_depth: int = 3) -> ProgramNode:
+        import random
+        # 叶子：变量或常数，并可能包一元函数
+        if depth >= max_depth or random.random() < 0.35:
+            if random.random() < 0.7 and self.dsl_variables:
+                node: ProgramNode = TerminalNode(random.choice(self.dsl_variables))
+            else:
+                node = TerminalNode(random.choice(self.dsl_constants) if self.dsl_constants else 1.0)
+            unary_pool = [op for op in self.dsl_operators if op in ('abs','sin','cos','tan','log1p','sqrt')]
+            if unary_pool and random.random() < 0.4:
+                node = UnaryOpNode(random.choice(unary_pool), node)
+            return node
+        # 内部：二元组合
+        left = self._generate_random_expression(depth+1, max_depth)
+        right = self._generate_random_expression(depth+1, max_depth)
+        bin_pool = [op for op in self.dsl_operators if op in ('+','-','*','/','max','min')]
+        op = random.choice(bin_pool) if bin_pool else '*'
+        return BinaryOpNode(op, left, right)
     def _ast_to_str(self,node:ProgramNode)->str:
         if isinstance(node,BinaryOpNode): return f"({self._ast_to_str(node.left)} {node.op} {self._ast_to_str(node.right)})"
         if isinstance(node,UnaryOpNode): return f"{node.op}({self._ast_to_str(node.child)})"
@@ -1267,8 +1321,9 @@ class MCTS_Agent:
             cond = self._ast_to_str(rule['condition'])
             acts = []
             for a in rule['action']:
-                if isinstance(a,BinaryOpNode) and a.op=='set' and isinstance(a.left,TerminalNode) and isinstance(a.right,TerminalNode):
-                    acts.append(f"{a.left.value}:{a.right.value}")
+                if isinstance(a,BinaryOpNode) and a.op=='set' and isinstance(a.left,TerminalNode):
+                    rstr = self._ast_to_str(a.right) if hasattr(a,'right') else '0'
+                    acts.append(f"{a.left.value}:{rstr}")
             parts.append(cond+"|"+",".join(sorted(acts)))
         # 将可变 salt 混入哈希，隔离不同评估上下文的 TT 记录（例如不同 duration/批次）
         salt = str(getattr(self, '_tt_salt', ''))

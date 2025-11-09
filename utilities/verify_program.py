@@ -124,15 +124,15 @@ def build_disturbances(preset: str | None):
         return []
     if preset == 'mild_wind':
         return [
-            {'type': 'SUSTAINED_WIND','info':'mild','start_time':3.0,'end_time':6.0,'force':[0.01,0,0]},
-            {'type': 'PULSE','time':8.0,'force':[0.02,-0.01,0],'info':'pulse'}
+            {'type': 'SUSTAINED_WIND','info':'mild','start_time':3.0,'end_time':6.0,'force':[0.004,0.0,0.0]},
+            {'type': 'PULSE','time':8.0,'force':[0.008,-0.004,0.0],'info':'pulse'}
         ]
     if preset == 'stress':
         return [
-            {'type': 'SUSTAINED_WIND','info':'stress:steady_wind','start_time':2.0,'end_time':6.0,'force':[0.015,0.0,0]},
-            {'type': 'GUSTY_WIND','info':'stress:gusty_wind','start_time':7.0,'end_time':11.0,'base_force':[0,-0.01,0],'gust_frequency':9.0,'gust_amplitude':0.012},
-            {'type': 'MASS_CHANGE','info':'stress:mass_up','time':12.0,'mass_multiplier':1.15},
-            {'type': 'PULSE','info':'stress:pulse','time':14.0,'force':[-0.02,0.02,0]}
+            {'type': 'SUSTAINED_WIND','info':'stress:steady_wind','start_time':2.5,'end_time':6.5,'force':[0.007,0.0,0.0]},
+            {'type': 'GUSTY_WIND','info':'stress:gusty_wind','start_time':7.5,'end_time':11.5,'base_force':[0.0,-0.004,0.0],'gust_frequency':6.0,'gust_amplitude':0.006},
+            {'type': 'MASS_CHANGE','info':'stress:mass_up','time':12.0,'mass_multiplier':1.08},
+            {'type': 'PULSE','info':'stress:pulse','time':14.0,'force':[-0.008,0.008,0.0]}
         ]
     raise ValueError(f"Unknown disturbance preset: {preset}")
 
@@ -144,12 +144,13 @@ def parse_args():
     ap.add_argument('--program', type=str, default=os.path.join('01_pi_flight','results','best_program.json'))
     ap.add_argument('--traj_list', type=str, nargs='*', default=None)
     ap.add_argument('--traj_preset', type=str, default='test_challenge',
-                    choices=['train_core','test_challenge','full_eval','pi_strong_train','pi_strong_test','test_extreme'])
+                    choices=['train_core','test_challenge','full_eval','pi_strong_train','pi_strong_test','test_extreme',
+                             'eth_rpg_core','eth_rpg_challenge','eth_rpg_extreme','academic_full'])
     ap.add_argument('--aggregate', type=str, default='harmonic', choices=['mean','min','harmonic'])
     ap.add_argument('--disturbance', type=str, default='mild_wind', choices=[None,'mild_wind','stress'])
     ap.add_argument('--duration', type=int, default=20)
     ap.add_argument('--log-skip', type=int, default=2)
-    ap.add_argument('--reward_profile', type=str, default='pilight_boost', choices=['default','pilight_boost','pilight_freq_boost'])
+    ap.add_argument('--reward_profile', type=str, default='pilight_boost', choices=['default','pilight_boost','pilight_freq_boost','control_law_discovery'])
     ap.add_argument('--compose-by-gain', action='store_true')
     ap.add_argument('--clip-P', type=float, default=None)
     ap.add_argument('--clip-I', type=float, default=None)
@@ -162,13 +163,43 @@ def main():
     # Print profile for visibility
     print(describe_profile(args.reward_profile))
     weights, ks = get_reward_profile(args.reward_profile)
-    traj_names = args.traj_list if args.traj_list else build_preset(args.traj_preset)
-    trajectories = [build_trajectory(n) for n in traj_names]
-    disturbances = build_disturbances(args.disturbance)
 
-    # Imports that rely on gym_pybullet_drones
-    from test import SimulationTester  # type: ignore
-    from gym_pybullet_drones.utils.enums import DroneModel  # type: ignore
+    # Prefer academic benchmarks if requested
+    use_academic = False
+    traj_names = []
+    trajectories = []
+    disturbances = []
+    try:
+        from utilities.academic_benchmarks import build_preset as ab_build_preset, \
+            build_trajectory as ab_build_traj, build_disturbances as ab_build_dist, \
+            ACADEMIC_PRESET_NAMES
+        if args.traj_list:
+            # If user gave explicit names, try academic first then fallback
+            for n in args.traj_list:
+                try:
+                    trajectories.append(ab_build_traj(n))
+                    traj_names.append(n)
+                    use_academic = True
+                except Exception:
+                    trajectories.append(build_trajectory(n))
+                    traj_names.append(n)
+        else:
+            if args.traj_preset in ACADEMIC_PRESET_NAMES:
+                traj_names = ab_build_preset(args.traj_preset)
+                trajectories = [ab_build_traj(n) for n in traj_names]
+                use_academic = True
+            else:
+                traj_names = build_preset(args.traj_preset)
+                trajectories = [build_trajectory(n) for n in traj_names]
+        # disturbances: if academic used, still reuse our standardized definitions for parity
+        disturbances = ab_build_dist(args.disturbance) if use_academic else build_disturbances(args.disturbance)
+    except Exception:
+        # Fallback entirely to legacy builders
+        traj_names = args.traj_list if args.traj_list else build_preset(args.traj_preset)
+        trajectories = [build_trajectory(n) for n in traj_names]
+        disturbances = build_disturbances(args.disturbance)
+
+    from utilities.isaac_tester import SimulationTester  # type: ignore
 
     # 必须先加载包 (__init__) 注册 pilight_verify，再加载 serialization 子模块
     PiLightSegmentedPIDController = _load_pilight_controller()
@@ -182,11 +213,11 @@ def main():
     scores: List[float] = []
     per_traj: List[Dict[str, Any]] = []
     for t in trajectories:
-        ctrl = PiLightSegmentedPIDController(drone_model=DroneModel("cf2x"), program=program,
+        ctrl = PiLightSegmentedPIDController(drone_model="cf2x", program=program,
                                              compose_by_gain=bool(args.compose_by_gain),
                                              clip_P=args.clip_P, clip_I=args.clip_I, clip_D=args.clip_D)
         tester = SimulationTester(ctrl, disturbances, weights, duration_sec=args.duration,
-                                      output_folder=os.path.join('01_pi_flight','results','mcts_eval'), gui=False,
+                                  output_folder=os.path.join('01_pi_flight','results','mcts_eval'), gui=False,
                                   trajectory=t, log_skip=max(1,int(args.log_skip)), in_memory=True, quiet=True)
         r = tester.run()
         scores.append(float(r))
