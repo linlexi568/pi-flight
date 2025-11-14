@@ -39,7 +39,6 @@ export DEBUG_STEPWISE=1
 echo -e "${GREEN}🚀 开始测试...${NC}\n"
 
 "$VENV_PYTHON" 01_pi_flight/train_online.py \
-    --use-gnn \
     --traj hover \
     --duration 4 \
     --total-iters 10 \
@@ -53,6 +52,9 @@ echo -e "${GREEN}🚀 开始测试...${NC}\n"
     --min-steps-frac 0.3 \
     --reward-reduction mean \
     --save-path "$RESULT_FILE" \
+    --use-fast-path \
+    --debug-programs \
+    --debug-programs-limit 24 \
     2>&1 | tee "$LOG_FILE"
 
 EXIT_CODE=${PIPESTATUS[0]}

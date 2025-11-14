@@ -3,14 +3,14 @@ from typing import List, Any, Dict, Optional, Tuple, Set, Callable, Union
 
 # Import DSL nodes from parent package
 try:
-    from ..dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+    from ..core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 except Exception:
     # Fallback for script mode
     import sys, pathlib
     _parent = pathlib.Path(__file__).resolve().parent.parent
     if str(_parent) not in sys.path:
         sys.path.insert(0, str(_parent))
-    from dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+    from core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 
 class MCTSNode:
     """Tree node with progressive widening & action cache.
@@ -1237,19 +1237,20 @@ class MCTS_Agent:
                     cond.left = UnaryOpNode('abs', TerminalNode(var_name))
                     cond.op = '<'
                 if var_name:
+                    # 放宽条件裁剪上限1.5倍，允许更宽松的条件产生差异化动作
                     strict_caps = {
-                        'pos_err_z': {'lt_max': 1.0, 'gt_min': 0.15},
-                        'pos_err_xy': {'lt_max': 1.6, 'gt_min': 0.2},
-                        'ang_vel_x': {'lt_max': 2.2, 'gt_min': 0.3},
-                        'ang_vel_y': {'lt_max': 2.2, 'gt_min': 0.3},
-                        'ang_vel_mag': {'lt_max': 2.5, 'gt_min': 0.4},
-                        'rpy_err_mag': {'lt_max': 1.8, 'gt_min': 0.2},
-                        'pos_err_z_abs': {'lt_max': 1.2, 'gt_min': 0.15},
-                        'err_i_z': {'lt_max': 2.0, 'gt_min': 0.25},
-                        'err_i_x': {'lt_max': 2.0, 'gt_min': 0.25},
-                        'err_i_y': {'lt_max': 2.0, 'gt_min': 0.25},
+                        'pos_err_z': {'lt_max': 1.5, 'gt_min': 0.1},  # 原1.0→1.5
+                        'pos_err_xy': {'lt_max': 2.4, 'gt_min': 0.15},  # 原1.6→2.4
+                        'ang_vel_x': {'lt_max': 3.3, 'gt_min': 0.2},  # 原2.2→3.3
+                        'ang_vel_y': {'lt_max': 3.3, 'gt_min': 0.2},
+                        'ang_vel_mag': {'lt_max': 3.75, 'gt_min': 0.25},
+                        'rpy_err_mag': {'lt_max': 2.7, 'gt_min': 0.15},
+                        'pos_err_z_abs': {'lt_max': 1.8, 'gt_min': 0.1},
+                        'err_i_z': {'lt_max': 3.0, 'gt_min': 0.15},
+                        'err_i_x': {'lt_max': 3.0, 'gt_min': 0.15},
+                        'err_i_y': {'lt_max': 3.0, 'gt_min': 0.15},
                     }
-                    caps = {'lt_max': 1.5, 'gt_min': 0.2}
+                    caps = {'lt_max': 2.25, 'gt_min': 0.15}  # 原1.5→2.25
                     if isinstance(var_name, str) and var_name in strict_caps:
                         caps = strict_caps[var_name]
                     if cond.op == '<':
@@ -1260,7 +1261,7 @@ class MCTS_Agent:
                     # 若左侧为 abs() 且比较为 '>'，这种条件往往过宽，改为 '<' 并使用较紧阈值
                     if isinstance(cond.left, UnaryOpNode) and cond.left.op == 'abs' and cond.op == '>':
                         cond.op = '<'
-                        T = min(T, caps['lt_max'] * 0.6)
+                        T = min(T, caps['lt_max'] * 0.7)  # 原0.6→0.7，略微放宽
                     # trig 相位窗口再收紧一次（若已启用）
                     if bool(getattr(self, '_trig_as_phase_window', False)) and has_trig(cond.left):
                         cond.op = '<'
@@ -1298,7 +1299,12 @@ class MCTS_Agent:
                 node: ProgramNode = TerminalNode(random.choice(self.dsl_variables))
             else:
                 node = TerminalNode(random.choice(self.dsl_constants) if self.dsl_constants else 1.0)
-            unary_pool = [op for op in self.dsl_operators if op in ('abs','sin','cos','tan','log1p','sqrt')]
+            # 扩展一元算子池：包含基础一元以及参数化前缀的一元原语
+            def _is_unary(op:str)->bool:
+                base = op.split(':',1)[0]
+                return base in ('abs','sin','cos','tan','log1p','sqrt',
+                                'ema','delay','diff','clamp','deadzone','rate','rate_limit','smooth','smoothstep')
+            unary_pool = [op for op in self.dsl_operators if _is_unary(op)]
             if unary_pool and random.random() < 0.4:
                 node = UnaryOpNode(random.choice(unary_pool), node)
             return node

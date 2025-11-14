@@ -23,26 +23,31 @@ if [ ! -f "$VENV_PYTHON" ]; then
 fi
 
 ################################################################################
-# 🔧 训练参数配置 (直接改这里的数字就行)
+# 🔧 训练参数配置 - 平滑控制优先模式
 ################################################################################
-CFG_ITERS=1000                  # 总迭代数（长跑150轮）
-CFG_SIMS=800                   # 每轮MCTS模拟次数（安全档，避免初始化过慢）
-CFG_ENVS=1024                  # 并行环境数量（安全档，8GB 显存建议 512~1024）
-CFG_DURATION=8                  # Episode时长(秒)（适度缩短提升吞吐）
-CFG_TRAJ="circle"                # 任务: hover/circle/其他
-CFG_EVAL_REPLICAS=3             # 每程序评估次数（3次折中稳定与速度）
-CFG_UPDATE_FREQ=10               # 每N轮更新GNN (从10降至8, 更频繁学习)
-CFG_TRAIN_STEPS=10              # 每次更新训练步数（略降，保证每轮时间可控）
-CFG_BATCH_SIZE=128              # 批大小（降低以节省显存，避免OOM）
+CFG_ITERS=150                  # 总迭代数（测试跑150轮）
+CFG_SIMS=800                   # 每轮MCTS模拟次数
+CFG_ENVS=1024                  # 并行环境数量
+CFG_DURATION=6                  # Episode时长(秒)
+CFG_TRAJ="circle"                # 任务: hover/circle/figure8
+CFG_EVAL_REPLICAS=3             # 每程序评估次数
+CFG_UPDATE_FREQ=10               # 每N轮更新GNN
+CFG_TRAIN_STEPS=10              # 每次更新训练步数
+CFG_BATCH_SIZE=128              # 批大小
 CFG_MIN_STEPS_FRAC=0.3        # 最短步数比例 
 CFG_LR=1e-3                   # 学习率
-CFG_CHECKPOINT_FREQ=40       # Checkpoint保存频率 (从50降至40, 更频繁保存)
-CFG_REWARD_REDUCTION="mean"   # 奖励聚合: sum/mean（与代码一致）
+CFG_CHECKPOINT_FREQ=40       # Checkpoint保存频率
+CFG_REWARD_REDUCTION="mean"   # 奖励聚合: sum/mean
+# 🔥 奖励配置：平衡型（不奔着PID，强调可部署性）
+CFG_REWARD_PROFILE="balanced_smooth"  # 平衡平滑/控制代价/响应/物理约束
 
 ################################################################################
 # 📌 说明:
-# 运行轮数以顶部 CFG_ITERS 为准（如需长跑可将其改为 150）。
-# 其余参数为重型配置，需确保GPU/CPU/内存资源充足。
+# 使用 balanced_smooth 奖励配置，强调：
+# - smoothness_jerk: 0.80 (鼓励平滑，但不过度抑制探索)
+# - control_effort: 0.60 (限制大幅控制变化，保留响应)
+# - high_freq: 0.80 (抑制高频振荡，兼顾灵活性)
+# 适用于需要“不过度平滑 + 可部署 + 合理跟踪/响应”的控制策略场景
 ################################################################################
 
 # 创建目录
@@ -50,12 +55,12 @@ mkdir -p logs results 01_pi_flight/results
 
 # 生成时间戳文件名
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="logs/longrun_${CFG_ITERS}iters_${TIMESTAMP}.log"
-RESULT_FILE="01_pi_flight/results/longrun_${CFG_ITERS}iters_${TIMESTAMP}.json"
+LOG_FILE="logs/smooth_${CFG_ITERS}iters_${TIMESTAMP}.log"
+RESULT_FILE="01_pi_flight/results/smooth_${CFG_ITERS}iters_${TIMESTAMP}.json"
 
 # 显示配置
 echo -e "${BLUE}╔════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║             Pi-Flight 长跑训练 (${CFG_ITERS} 轮) + Ranking NN            ║${NC}"
+echo -e "${BLUE}║        Pi-Flight 平滑控制训练 (${CFG_ITERS} 轮) + Ranking NN         ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "${GREEN}📋 训练配置:${NC}"
@@ -68,6 +73,15 @@ echo -e "  时长: ${CFG_DURATION} 秒/episode"
 echo -e "  评估: ${CFG_EVAL_REPLICAS} 次/程序"
 echo -e "  学习率: ${CFG_LR}"
 echo -e "  Ranking: ✅ 启用 (lr=1e-3, 零动作惩罚=2.0→0.1)"
+echo -e "  🔥 奖励配置: ${CFG_REWARD_PROFILE} (强调平滑度和控制代价)"
+echo ""
+echo -e "${YELLOW}奖励权重详情:${NC}"
+echo -e "  smoothness_jerk: 1.20 (k=0.65) - 🔥 高权重抑制加加速度"
+echo -e "  control_effort:  0.85 (k=0.35) - 🔥 高权重惩罚控制变化"
+echo -e "  high_freq:       1.00 (k=3.2)  - 🔥 强抑制高频振荡"
+echo -e "  position_rmse:   0.70 (k=0.9)  - 适度降低跟踪精度要求"
+echo -e "  settling_time:   0.90 (k=1.1)  - 保持鲁棒性关注"
+echo -e "  saturation:      1.10 (k=1.3)  - 严格惩罚饱和"
 echo ""
 echo -e "${YELLOW}💾 输出:${NC}"
 echo -e "  日志: $LOG_FILE"
@@ -80,7 +94,6 @@ echo ""
 
 # 启动训练
 export DEBUG_STEPWISE=1
-# export DEBUG_ENV_POOL=1  # 取消注释可查看环境池复用日志
 
 "$VENV_PYTHON" 01_pi_flight/train_online.py \
     --use-fast-path \
@@ -95,6 +108,7 @@ export DEBUG_STEPWISE=1
     --eval-replicas-per-program "${CFG_EVAL_REPLICAS}" \
     --min-steps-frac "${CFG_MIN_STEPS_FRAC}" \
     --reward-reduction "${CFG_REWARD_REDUCTION}" \
+    --reward-profile "${CFG_REWARD_PROFILE}" \
     --learning-rate "${CFG_LR}" \
     --checkpoint-freq "${CFG_CHECKPOINT_FREQ}" \
     --ranking-lr 1e-3 \
@@ -115,6 +129,12 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}✅ 训练完成!${NC}"
     echo -e "${BLUE}📊 结果: $RESULT_FILE${NC}"
     echo -e "${BLUE}📄 日志: $LOG_FILE${NC}"
+    echo ""
+    echo -e "${YELLOW}🔍 预期效果:${NC}"
+    echo -e "  ✓ 更平滑的轨迹 (低 jerk)"
+    echo -e "  ✓ 更小的控制输出变化"
+    echo -e "  ✓ 低高频振荡"
+    echo -e "  ✓ 物理可实现的控制策略"
 else
     echo -e "${RED}❌ 训练失败 (退出码: $EXIT_CODE)${NC}"
     echo -e "${YELLOW}查看日志: $LOG_FILE${NC}"

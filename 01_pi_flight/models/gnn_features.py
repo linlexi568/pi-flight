@@ -10,9 +10,9 @@ import numpy as np
 
 # 导入DSL节点类型
 try:
-    from .dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+    from ..core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 except Exception:
-    from dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+    from core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 
 # PyTorch Geometric (延迟导入，避免依赖问题)
 try:
@@ -332,7 +332,7 @@ if __name__ == '__main__':
     if str(_parent) not in sys.path:
         sys.path.insert(0, str(_parent))
     
-    from dsl import TerminalNode, BinaryOpNode
+    from core.dsl import TerminalNode, BinaryOpNode
     
     print("=" * 60)
     print("测试 AST → 图转换")

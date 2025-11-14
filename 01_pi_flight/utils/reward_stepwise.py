@@ -53,11 +53,25 @@ class StepwiseRewardCalculator:
         self.prev_pos_err = torch.zeros(num_envs, device=self.device)
         self.settle_progress = torch.zeros(num_envs, device=self.device)  # 误差下降趋势积分
         self.steps = 0
+        # 组件累积（记录加权后的分量总和，便于批次结束时导出指标）
+        self._comp_accum = {
+            'position_rmse': torch.zeros(num_envs, device=self.device),
+            'settling_time': torch.zeros(num_envs, device=self.device),
+            'control_effort': torch.zeros(num_envs, device=self.device),
+            'smoothness_jerk': torch.zeros(num_envs, device=self.device),
+            'gain_stability': torch.zeros(num_envs, device=self.device),
+            'saturation': torch.zeros(num_envs, device=self.device),
+            'peak_error': torch.zeros(num_envs, device=self.device),
+            'high_freq': torch.zeros(num_envs, device=self.device),
+        }
 
     @staticmethod
     def _exp_shape(metric: torch.Tensor, k: float) -> torch.Tensor:
         # 防止数值下溢: 限制 metric 范围
-        return torch.exp(-k * torch.clamp(metric, min=0.0, max=1e6))
+        # 返回 -1 * (1 - exp(-k*metric)) 使其变为负惩罚
+        # metric=0 → reward=0 (理想)
+        # metric→∞ → reward→-1 (最差单分量)
+        return -1.0 * (1.0 - torch.exp(-k * torch.clamp(metric, min=0.0, max=1e6)))
 
     def compute_step(self,
                      pos: torch.Tensor,           # [N,3]
@@ -132,25 +146,47 @@ class StepwiseRewardCalculator:
         r_hf = self._exp_shape(hf_energy, self.k.get('k_high_freq', 3.0)) * active_f
 
         # 组装加权和
-        total = (
-            self.w.get('position_rmse',0.0)*r_pos +
-            self.w.get('settling_time',0.0)*r_settle +
-            self.w.get('control_effort',0.0)*r_effort +
-            self.w.get('smoothness_jerk',0.0)*r_jerk +
-            self.w.get('gain_stability',0.0)*r_gain +
-            self.w.get('saturation',0.0)*r_sat +
-            self.w.get('peak_error',0.0)*r_peak +
-            self.w.get('high_freq',0.0)*r_hf
-        )
+        c_pos = self.w.get('position_rmse',0.0)*r_pos
+        c_settle = self.w.get('settling_time',0.0)*r_settle
+        c_effort = self.w.get('control_effort',0.0)*r_effort
+        c_jerk = self.w.get('smoothness_jerk',0.0)*r_jerk
+        c_gain = self.w.get('gain_stability',0.0)*r_gain
+        c_sat = self.w.get('saturation',0.0)*r_sat
+        c_peak = self.w.get('peak_error',0.0)*r_peak
+        c_hf = self.w.get('high_freq',0.0)*r_hf
+        total = (c_pos + c_settle + c_effort + c_jerk + c_gain + c_sat + c_peak + c_hf)
+        # 累积各组件（加权后）
+        self._comp_accum['position_rmse'] += c_pos
+        self._comp_accum['settling_time'] += c_settle
+        self._comp_accum['control_effort'] += c_effort
+        self._comp_accum['smoothness_jerk'] += c_jerk
+        self._comp_accum['gain_stability'] += c_gain
+        self._comp_accim = self._comp_accum  # alias to avoid accidental typos
+        self._comp_accum['saturation'] += c_sat
+        self._comp_accum['peak_error'] += c_peak
+        self._comp_accum['high_freq'] += c_hf
         return total
 
     def finalize(self) -> torch.Tensor:
         """在一个评估批结束时调用,用于追加峰值误差与整体下降趋势的奖励校正。"""
-        # 峰值误差：误差越小最终奖励越高
-        peak_shape = self._exp_shape(self.max_pos_err, self.k.get('k_peak', 1.5))
-        # 总下降趋势归一（强奖励快速收敛）
-        settle_bonus = torch.clamp(self.settle_progress / (1.0 + self.steps), min=0.0)
-        bonus = 0.2 * peak_shape + 0.3 * settle_bonus  # 权重经验值，可后续调参
-        return bonus
+        # 峰值误差：误差越小惩罚越少（已经是负值）
+        peak_penalty = self._exp_shape(self.max_pos_err, self.k.get('k_peak', 1.5))
+        # 总下降趋势归一：下降快给正奖励
+        settle_ratio = torch.clamp(self.settle_progress / (1.0 + self.steps), min=0.0, max=1.0)
+        # settle_bonus: 0→1 映射为少量正奖励抵消部分惩罚
+        settle_bonus = 0.5 * settle_ratio  # 最多+0.5 补偿
+        # 总体仍然是负惩罚为主
+        return 0.3 * peak_penalty + settle_bonus
+
+    def get_component_totals(self) -> Dict[str, torch.Tensor]:
+        """返回本批次累计的各奖励分量（加权后）的总和，shape 均为 [N]。"""
+        return {k: v.clone() for k, v in self._comp_accum.items()}
+
+    def reset_components(self, num_envs: int = None):
+        """重置组件累积（用于新的一批评估）。"""
+        if num_envs is None:
+            num_envs = self.num_envs
+        for k in self._comp_accum.keys():
+            self._comp_accum[k] = torch.zeros(num_envs, device=self.device)
 
 __all__ = ["StepwiseRewardCalculator"]

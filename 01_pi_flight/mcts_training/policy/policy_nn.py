@@ -83,59 +83,25 @@ class PolicyValueNNModel(PolicyNNModel):  # type: ignore[misc]
         return logits, v
 
 
+## NOTE: PolicyValueNNLarge 已弃用并被 GNN v2 分层网络取代。
+## 为保持向后兼容（旧 checkpoint 载入时避免崩溃），这里保留一个瘦身占位符。
 class PolicyValueNNLarge(nn.Module if TORCH_AVAILABLE else object):  # type: ignore[misc]
-    """Large Policy+Value network for online learning (64-dim input, 256 hidden).
-    
-    用于在线学习的大型策略-价值网络：
-    - 输入：64维程序结构特征（来自 program_features.py）
-    - 输出：策略logits（变异类型分布）+ 价值估计（程序性能）
-    """
-    def __init__(self, in_dim: int = 64, hidden: int = 256, out_dim: int = len(EDIT_TYPES)):
-        if not TORCH_AVAILABLE:
-            self.in_dim = in_dim; self.hidden = hidden; self.out_dim = out_dim
-            return
-        super().__init__()
-        
-        # 特征编码器（3层MLP）
-        self.encoder = nn.Sequential(  # type: ignore[attr-defined]
-            nn.Linear(in_dim, hidden),  # type: ignore[attr-defined]
-            nn.ReLU(),  # type: ignore[attr-defined]
-            nn.Linear(hidden, hidden),  # type: ignore[attr-defined]
-            nn.ReLU(),  # type: ignore[attr-defined]
-            nn.Linear(hidden, hidden),  # type: ignore[attr-defined]
-            nn.ReLU()  # type: ignore[attr-defined]
-        )
-        
-        # 策略头（预测变异类型偏好）
-        self.policy_head = nn.Sequential(  # type: ignore[attr-defined]
-            nn.Linear(hidden, hidden // 2),  # type: ignore[attr-defined]
-            nn.ReLU(),  # type: ignore[attr-defined]
-            nn.Linear(hidden // 2, out_dim)  # type: ignore[attr-defined]
-        )
-        
-        # 价值头（预测程序性能）
-        self.value_head = nn.Sequential(  # type: ignore[attr-defined]
-            nn.Linear(hidden, hidden // 2),  # type: ignore[attr-defined]
-            nn.ReLU(),  # type: ignore[attr-defined]
-            nn.Linear(hidden // 2, 1),  # type: ignore[attr-defined]
-            nn.Tanh()  # type: ignore[attr-defined]  # 输出 [-1, 1]
-        )
-    
+    def __init__(self, *args, **kwargs):
+        if TORCH_AVAILABLE:
+            super().__init__()
+            # 极简单层，输出恒零 (logits, value)；用于旧代码反序列化不再实际训练。
+            self.dummy = nn.Parameter(torch.zeros(1))  # type: ignore[attr-defined]
+        else:
+            self.dummy = 0.0  # type: ignore[assignment]
+
     def forward(self, x):  # type: ignore[override]
         if not TORCH_AVAILABLE:
-            shape0 = x.shape[0] if hasattr(x, 'shape') else 1
-            logits = [[0.0 for _ in range(len(EDIT_TYPES))] for _ in range(shape0)]
-            vals = [0.0 for _ in range(shape0)]
-            return logits, vals
-        
-        # 共享特征编码
-        h = self.encoder(x)  # type: ignore[attr-defined]
-        
-        # 策略和价值输出
-        policy_logits = self.policy_head(h)  # type: ignore[attr-defined]
-        value = self.value_head(h)  # type: ignore[attr-defined]
-        
-        return policy_logits, value
+            shape0 = getattr(x, 'shape', [1])[0] if hasattr(x, 'shape') else 1
+            return [[0.0 for _ in range(len(EDIT_TYPES))] for _ in range(shape0)], [0.0 for _ in range(shape0)]
+        b = x.shape[0] if hasattr(x, 'shape') else 1
+        logits = torch.zeros(b, len(EDIT_TYPES), device=self.dummy.device)  # type: ignore[attr-defined]
+        value = torch.zeros(b, 1, device=self.dummy.device)  # type: ignore[attr-defined]
+        return logits, value
 
 def build_features(node, agent) -> List[float]:
     """Build a compact feature vector for the current node.

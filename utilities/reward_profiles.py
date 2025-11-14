@@ -103,8 +103,8 @@ _control_law_discovery_weights: Weights = {
     "settling_time": 1.00,
     # 中等关注控制代价（允许为鲁棒性付出一定代价）
     "control_effort": 0.40,
-    # 高度重视平滑性（符号DSL程序应产生平滑增益切换）
-    "smoothness_jerk": 1.20,
+    # 完全移除平滑性权重（从1.20→0.50→0.20→0.0），避免过度约束大动作探索，让NN自主学习控制策略
+    "smoothness_jerk": 0.0,
     # 核心鲁棒性指标：增益稳定性（避免振荡）
     "gain_stability": 1.25,
     # 严格惩罚饱和（饱和意味着控制律在极端情况下失效）
@@ -122,8 +122,8 @@ _control_law_discovery_ks: Coeffs = {
     "k_settle": 1.3,
     # 中等控制代价敏感度
     "k_effort": 0.18,
-    # 严格的平滑性要求
-    "k_jerk": 0.70,
+    # 进一步放宽平滑性shaping系数（从0.70→0.35→0.20），大幅降低对jerk的敏感度
+    "k_jerk": 0.20,
     # 强惩罚增益振荡
     "k_gain": 0.35,
     # 极严格的饱和惩罚
@@ -134,11 +134,76 @@ _control_law_discovery_ks: Coeffs = {
     "k_high_freq": 2.5,
 }
 
+# 新增：平滑控制优先 profile（强调 smoothness 和 control effort）
+# 适用于需要生成人类可接受、物理可实现、低振动的控制策略场景
+_smooth_control_weights: Weights = {
+    # 适度降低位置误差权重，平衡跟踪精度与平滑性
+    "position_rmse": 0.70,
+    # 保持鲁棒性关注
+    "settling_time": 0.90,
+    # 🔥 显著提升控制代价权重，惩罚过大的控制输出变化
+    "control_effort": 0.85,
+    # 🔥 重点强调平滑性，抑制加加速度（jerk），生成更平滑的轨迹
+    "smoothness_jerk": 1.20,
+    # 中等关注增益稳定性
+    "gain_stability": 0.80,
+    # 严格惩罚饱和
+    "saturation": 1.10,
+    # 适度关注峰值误差
+    "peak_error": 0.95,
+    # 强调高频能量抑制，避免高频振荡
+    "high_freq": 1.00,
+}
+
+_smooth_control_ks: Coeffs = {
+    # 稍宽容的位置误差
+    "k_position": 0.9,
+    # 适中的恢复速度要求
+    "k_settle": 1.1,
+    # 🔥 强敏感的控制代价 shaping，快速惩罚大幅动作变化
+    "k_effort": 0.35,
+    # 🔥 强敏感的 jerk shaping，严格抑制加加速度突变
+    "k_jerk": 0.65,
+    # 适度增益稳定性惩罚
+    "k_gain": 0.28,
+    # 严格饱和惩罚
+    "k_sat": 1.3,
+    # 适中峰值惩罚
+    "k_peak": 1.6,
+    # 强高频惩罚
+    "k_high_freq": 3.2,
+}
+
+# 平衡型：在不追求PID的前提下，兼顾平滑性、控制代价与跟踪/响应
+_balanced_smooth_weights: Weights = {
+    "position_rmse": 0.80,     # 维持一定跟踪精度要求
+    "settling_time": 1.00,     # 保证有足够的响应速度
+    "control_effort": 0.50,    # 中等权重，限制过大控制变化
+    "smoothness_jerk": 0.60,   # 中等偏高，鼓励平滑但不过度抑制探索
+    "gain_stability": 0.90,    # 稳定性较高权重，减少振荡
+    "saturation": 1.20,        # 严格惩罚饱和，保障物理可实现
+    "peak_error": 1.00,        # 关注瞬态峰值
+    "high_freq": 0.80,         # 抑制高频能量，但不过强
+}
+
+_balanced_smooth_ks: Coeffs = {
+    "k_position": 1.0,
+    "k_settle": 1.1,
+    "k_effort": 0.30,    # 略低于 smooth_control，允许必要的响应动作
+    "k_jerk": 0.50,      # 略低于 smooth_control，避免过度平滑
+    "k_gain": 0.25,
+    "k_sat": 1.3,
+    "k_peak": 1.8,
+    "k_high_freq": 2.5,  # 稍弱于 smooth_control，保留探索弹性
+}
+
 PROFILES: Dict[str, Tuple[Weights, Coeffs]] = {
     "default": (_default_weights, _default_ks),
     "pilight_boost": (_pilight_boost_weights, _pilight_boost_ks),
     "pilight_freq_boost": (_pilight_freq_boost_weights, _pilight_freq_boost_ks),
     "control_law_discovery": (_control_law_discovery_weights, _control_law_discovery_ks),
+    "smooth_control": (_smooth_control_weights, _smooth_control_ks),
+    "balanced_smooth": (_balanced_smooth_weights, _balanced_smooth_ks),
 }
 
 

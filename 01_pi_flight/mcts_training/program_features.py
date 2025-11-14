@@ -9,9 +9,14 @@ import torch
 
 # 导入DSL节点类型
 try:
-    from ..dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+    from core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 except Exception:
-    from dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+    # 添加路径以支持直接运行
+    import sys, pathlib
+    _parent = pathlib.Path(__file__).resolve().parent.parent
+    if str(_parent) not in sys.path:
+        sys.path.insert(0, str(_parent))
+    from core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 
 
 def count_nodes_recursive(node: Any, counts: Dict[str, int]) -> None:

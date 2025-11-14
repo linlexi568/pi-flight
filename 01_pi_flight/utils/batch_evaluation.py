@@ -35,10 +35,15 @@ except Exception:
 
 # Stepwise 奖励计算器与权重
 try:
-    from .reward_stepwise import StepwiseRewardCalculator  # type: ignore
+    from utils.reward_stepwise import StepwiseRewardCalculator  # type: ignore
 except Exception:
     try:
-        from reward_stepwise import StepwiseRewardCalculator  # type: ignore
+        # 添加路径以支持直接运行
+        import sys, pathlib
+        _parent = pathlib.Path(__file__).resolve().parent.parent
+        if str(_parent) not in sys.path:
+            sys.path.insert(0, str(_parent))
+        from utils.reward_stepwise import StepwiseRewardCalculator  # type: ignore
     except Exception:
         StepwiseRewardCalculator = None  # type: ignore
 try:
@@ -53,25 +58,29 @@ class BatchEvaluator:
     def __init__(self, 
                  trajectory_config: Dict[str, Any],
                  duration: int = 20,
-                 isaac_num_envs: int = 512,
+                 isaac_num_envs: int = 96,
                  device: str = 'cuda:0',
-                 replicas_per_program: int = 1,
+                 replicas_per_program: int = 5,
                  min_steps_frac: float = 0.0,
-                 reward_reduction: str = 'sum',
+                 reward_reduction: str = 'mean',
                  reward_profile: str = 'control_law_discovery',
                  strict_no_prior: bool = True,
-                 zero_action_penalty: float = 1.5,
-                 use_fast_path: bool = True):
+                 zero_action_penalty: float = 5.0,
+                 use_fast_path: bool = True,
+                 complexity_bonus: float = 0.1,
+                 action_scale_multiplier: float = 1.0):
         """
         Args:
             trajectory_config: 轨迹配置 {'type': 'figure8', 'params': {...}}
             duration: 仿真时长（秒）
-            isaac_num_envs: Isaac Gym并行环境数
+            isaac_num_envs: Isaac Gym并行环境数 (优化后默认96)
             device: GPU设备
-            replicas_per_program: evaluate_single 时为同一程序生成多少副本并行评估，取平均
+            replicas_per_program: 每个程序评估N次取平均，减少方差 (优化后默认5)
             min_steps_frac: 每次评估至少执行的步数比例（0-1），避免过早 done 提前退出
             reward_reduction: 奖励归约方式：'sum'（步次求和）或 'mean'（步次平均，抵消存活时长偏差）
             reward_profile: 奖励配置文件名称
+            zero_action_penalty: 零动作惩罚 (优化后默认5.0)
+            complexity_bonus: 复杂度奖励系数 (每个唯一变量+0.1, 每条规则+0.05*bonus)
         """
         # 保险起见：运行期再尝试一次导入
         global ISAAC_GYM_AVAILABLE
@@ -109,7 +118,19 @@ class BatchEvaluator:
         try:
             self.zero_action_penalty = float(zero_action_penalty)
         except Exception:
-            self.zero_action_penalty = 1.5
+            self.zero_action_penalty = 0.0  # AlphaZero: 让NN自己学习
+        
+        # 复杂度奖励系数（鼓励使用多变量和多规则）
+        try:
+            self.complexity_bonus = float(complexity_bonus)
+        except Exception:
+            self.complexity_bonus = 0.0  # AlphaZero: 让NN自己学习复杂度权衡
+        
+        # 动作全局缩放系数（诊断用）
+        try:
+            self.action_scale_multiplier = float(action_scale_multiplier)
+        except Exception:
+            self.action_scale_multiplier = 1.0
         
         # 初始化 Stepwise 奖励计算器（使用 control_law_discovery 权重）
         try:
@@ -164,15 +185,20 @@ class BatchEvaluator:
         
         # 导入Isaac Gym环境
         try:
-            from .envs.isaac_gym_drone_env import IsaacGymDroneEnv
+            from envs.isaac_gym_drone_env import IsaacGymDroneEnv
         except ImportError:
             try:
+                # 添加路径以支持直接运行
+                import sys, pathlib
+                _parent = pathlib.Path(__file__).resolve().parent.parent
+                if str(_parent) not in sys.path:
+                    sys.path.insert(0, str(_parent))
                 from envs.isaac_gym_drone_env import IsaacGymDroneEnv
             except ImportError:
                 raise ImportError("无法导入IsaacGymDroneEnv，请检查envs目录")
         # 控制器
         try:
-            from .segmented_controller import PiLightSegmentedPIDController
+            from utils.segmented_controller import PiLightSegmentedPIDController
         except ImportError:
             try:
                 from segmented_controller import PiLightSegmentedPIDController
@@ -201,9 +227,14 @@ class BatchEvaluator:
         try:
             # 延迟导入 DSL 结点类型
             try:
-                from .dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode  # type: ignore
+                from core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode  # type: ignore
             except Exception:
-                from dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode  # type: ignore
+                # 添加路径以支持直接运行
+                import sys, pathlib
+                _parent = pathlib.Path(__file__).resolve().parent.parent
+                if str(_parent) not in sys.path:
+                    sys.path.insert(0, str(_parent))
+                from core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode  # type: ignore
 
             # 递归求值
             if isinstance(node, (int, float)):
@@ -321,32 +352,92 @@ class BatchEvaluator:
         tz = float(max(-0.01, min(0.01, tz)))
         return fz, tx, ty, tz
     
+    def _extract_variables_from_node(self, node) -> set:
+        """递归提取节点中的所有变量名"""
+        variables = set()
+        if node is None:
+            return variables
+        return variables
+
+    # ----- 执行路径判定：仅当程序为“无条件常量 set u_*”时才允许 UltraFast -----
+    def _is_const_program(self, program) -> bool:
+        """判断程序是否为仅包含无条件常量 set u_* 的形式。
+
+        满足条件：
+        - 每条规则为 dict 且 op == 'set'
+        - 不包含 condition 或 condition 为 None/False
+        - expr 为 {'type': 'const', 'value': ...}
+        只要出现任意复杂表达式/条件/非常量，就返回 False。
+        """
+        try:
+            for rule in program or []:
+                if not isinstance(rule, dict):
+                    return False
+                if rule.get('op') != 'set':
+                    return False
+                if rule.get('condition') not in (None, False):
+                    return False
+                expr = rule.get('expr', None)
+                if not isinstance(expr, dict) or expr.get('type') != 'const':
+                    return False
+                # 变量名必须在允许集合内（u_fz/u_tx/u_ty/u_tz），否则忽略但视为非常量程序
+                var = str(rule.get('var', ''))
+                if var not in ('u_fz','u_tx','u_ty','u_tz'):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _all_programs_const(self, programs) -> bool:
+        try:
+            return all(self._is_const_program(p) for p in (programs or []))
+        except Exception:
+            return False
+        
+        # 检查节点类型
+        node_type = type(node).__name__
+        
+        # TerminalNode: 检查是否是变量（字符串）
+        if node_type == 'TerminalNode':
+            if hasattr(node, 'value') and isinstance(node.value, str):
+                variables.add(node.value)
+        
+        # UnaryOpNode: 递归检查子节点
+        elif node_type == 'UnaryOpNode':
+            if hasattr(node, 'child'):
+                variables.update(self._extract_variables_from_node(node.child))
+        
+        # BinaryOpNode: 递归检查左右子节点
+        elif node_type == 'BinaryOpNode':
+            if hasattr(node, 'left'):
+                variables.update(self._extract_variables_from_node(node.left))
+            if hasattr(node, 'right'):
+                variables.update(self._extract_variables_from_node(node.right))
+        
+        return variables
+    
     def _eval_program_forces(self, program: List[Dict[str, Any]], state: Dict[str, float]) -> Tuple[float, float, float, float]:
         """在给定数值 state 下，求解程序产生的 (fz, tx, ty, tz)。
         策略：聚合所有满足条件的规则，将 set 的值累加（可适度裁剪）。
+        注意：仅当程序为“无条件常量 set u_*”形式时，才启用字典制式的快速路径缓存；
+        对于 AST 形式（rule={'condition':..., 'action':[BinaryOpNode('set',...)]}），必须走 AST 求值，否则会被错误地当作零动作缓存。
         """
-        # 🚀 快速路径: 如果启用且程序在缓存中
-        if self.use_fast_path:
+        # 🚀 快速路径: 仅在“无条件常量 set u_*”程序时启用
+        if self.use_fast_path and self._is_const_program(program):
             try:
-                # 程序哈希 (简化: 用str表示)
-                prog_str = str([(r.get('op'), r.get('var'), r.get('expr')) for r in program])
-                if prog_str in self._program_cache:
-                    return self._program_cache[prog_str]
-                
-                # 尝试快速编译
+                # 使用稳定的键，仅针对常量 set 规则
+                prog_key = str([(r.get('op'), r.get('var'), r.get('expr')) for r in program])
+                if prog_key in self._program_cache:
+                    return self._program_cache[prog_key]
+                # 常量编译
                 result = self._compile_program_fast(program)
-                self._program_cache[prog_str] = result
-                
-                # 调试: 首次缓存 (减少日志)
-                # if len(self._program_cache) <= 5:
-                #     print(f"[FastPath] 缓存新程序 (当前缓存数: {len(self._program_cache)})")
-                
+                self._program_cache[prog_key] = result
                 return result
-            except Exception as e:
-                # print(f"[FastPath] 快速编译失败: {e}, 回退到慢速路径")
-                pass  # Fallback到慢速路径
+            except Exception:
+                # 回退到 AST 求值
+                pass
         
-        # 慢速路径: 完整AST求值
+        # 慢速路径: 完整AST求值（AST-first 程序或包含条件/非常量表达式）
         fz = tx = ty = tz = 0.0
         try:
             for rule in program or []:
@@ -374,7 +465,22 @@ class BatchEvaluator:
         tx = float(max(-0.02, min(0.02, tx)))   # N*m
         ty = float(max(-0.02, min(0.02, ty)))   # N*m
         tz = float(max(-0.01, min(0.01, tz)))   # N*m（气动力矩较小）
-        return fz, tx, ty, tz
+        # 应用全局动作缩放系数（诊断专用）
+        scale = float(self.action_scale_multiplier)
+        return fz * scale, tx * scale, ty * scale, tz * scale
+
+    # ---------------------- 资源清理 ----------------------
+    def close(self):
+        """关闭底层环境池，释放GPU/PhysX资源（供基准或多次初始化场景使用）。"""
+        try:
+            if self._isaac_env_pool is not None:
+                try:
+                    self._isaac_env_pool.close()
+                except Exception:
+                    pass
+                self._isaac_env_pool = None
+        except Exception:
+            pass
 
     def _rpm_to_forces_local(self, rpm: np.ndarray) -> Tuple[float, float, float, float]:
         """将 4 电机 RPM 转换为 (fz, tx, ty, tz)，系数需与环境一致。"""
@@ -507,7 +613,7 @@ class BatchEvaluator:
                 from .segmented_controller import PiLightSegmentedPIDController
             except ImportError:
                 try:
-                    from segmented_controller import PiLightSegmentedPIDController
+                    from utils.segmented_controller import PiLightSegmentedPIDController
                 except ImportError:
                     PiLightSegmentedPIDController = None  # type: ignore
             if self.strict_no_prior:
@@ -579,8 +685,23 @@ class BatchEvaluator:
                     # 首次步骤: 预编译所有程序 (只做一次)
                     try:
                         if not hasattr(self, '_compiled_forces'):
-                            self._compiled_forces = self._ultra_executor.compile_programs(batch_programs)
-                            print(f"[UltraFast] ✅ 预编译{len(batch_programs)}程序 → 缓存{len(self._ultra_executor.program_cache)}个唯一程序")
+                            # 仅当所有程序皆为“无条件常量 set u_*”时，才启用 UltraFast
+                            if self._all_programs_const(batch_programs):
+                                self._compiled_forces = self._ultra_executor.compile_programs(batch_programs)
+                                print(f"[UltraFast] ✅ 预编译{len(batch_programs)}程序 → 缓存{len(self._ultra_executor.program_cache)}个唯一程序")
+                                # 若全部常量结果几乎为零，且严格无先验，则放弃 UltraFast 以避免长期零动作退化
+                                try:
+                                    import numpy as _np
+                                    if _np.all(_np.abs(self._compiled_forces) < 1e-8) and self.strict_no_prior:
+                                        print("[UltraFast] ⚠️ 全常量为零，禁用UltraFast以避免零动作退化")
+                                        self._ultra_executor = None
+                                        if hasattr(self, '_compiled_forces'):
+                                            delattr(self, '_compiled_forces')
+                                except Exception:
+                                    pass
+                            else:
+                                # 存在条件/非常量表达式：禁用 UltraFast，回退到逐步AST评估，确保动作依赖状态
+                                self._ultra_executor = None
                     except Exception as e:
                         print(f"[UltraFast] ⚠️ 预编译失败: {e}, 回退到标准快速路径")
                         self._ultra_executor = None
@@ -975,6 +1096,47 @@ class BatchEvaluator:
                         print(f"[DebugReward] zero-action programs in batch: {zero_cnt}/{batch_size}")
                     except Exception:
                         pass
+            
+            # 🔍 动作幅度统计（诊断用）：计算本批动作输出的平均幅度与最大值
+            if debug_enabled or batch_start == 0:
+                try:
+                    # 抓取本轮step中所有环境的fz/tx/ty/tz
+                    fz_vals = actions[:batch_size, 2].abs()
+                    tx_vals = actions[:batch_size, 3].abs()
+                    ty_vals = actions[:batch_size, 4].abs()
+                    tz_vals = actions[:batch_size, 5].abs()
+                    avg_fz = float(fz_vals.mean().item())
+                    max_fz = float(fz_vals.max().item())
+                    avg_tx = float(tx_vals.mean().item())
+                    max_tx = float(tx_vals.max().item())
+                    print(f"[ActionAmp] Batch{batch_start//programs_per_batch}: avg_fz={avg_fz:.4f}, max_fz={max_fz:.4f}, avg_tx={avg_tx:.6f}, max_tx={max_tx:.6f}")
+                except Exception:
+                    pass
+            
+            # 复杂度激励：奖励使用多变量和多规则的程序
+            if self.complexity_bonus > 0:
+                complexity_rewards = torch.zeros(batch_size, device=self.device)
+                for i in range(batch_size):
+                    prog = batch_programs[i]
+                    # 统计唯一变量数
+                    unique_vars = set()
+                    for rule in prog:
+                        node = rule.get('node', None)
+                        if node is not None:
+                            vars_in_node = self._extract_variables_from_node(node)
+                            unique_vars.update(vars_in_node)
+                    # 统计非空规则数
+                    num_rules = sum(1 for rule in prog if rule.get('node', None) is not None)
+                    # 复杂度奖励 = 2.0 * 变量数 + 1.0 * 规则数 (激进提升)
+                    bonus = self.complexity_bonus * len(unique_vars) + 0.5 * self.complexity_bonus * num_rules
+                    complexity_rewards[i] = bonus
+                total_rewards[:batch_size] += complexity_rewards
+                if debug_enabled:
+                    try:
+                        print(f"[DebugReward] complexity bonuses: {complexity_rewards[:min(8, batch_size)].cpu().numpy()}")
+                    except Exception:
+                        pass
+            
             # 归约
             if self.reward_reduction == 'mean':
                 denom = torch.clamp(steps_count[:batch_size], min=1.0)
@@ -1012,6 +1174,277 @@ class BatchEvaluator:
             return averaged_rewards
         
         return rewards
+
+    def evaluate_batch_with_metrics(self, programs: List[List[Dict[str, Any]]]) -> Tuple[List[float], List[Dict[str, float]]]:
+        """与 evaluate_batch 类似，但额外返回逐分量奖励汇总（加权后）用于分析/记录。
+
+        Returns:
+            rewards: 每个程序的总奖励（对 replicas 取平均后）
+            metrics: 每个程序的组件字典（同样对 replicas 平均），键包含：
+                     ['position_rmse','settling_time','control_effort','smoothness_jerk',
+                      'gain_stability','saturation','peak_error','high_freq','finalize_bonus']
+        """
+        # 初始化环境池
+        if self._isaac_env_pool is None:
+            self._init_isaac_gym_pool()
+
+        import torch  # type: ignore
+
+        num_programs_original = len(programs)
+        # 扩展 replicas
+        if self.replicas_per_program > 1:
+            programs_expanded = []
+            for prog in programs:
+                programs_expanded.extend([prog] * self.replicas_per_program)
+            programs = programs_expanded
+
+        num_programs = len(programs)
+        rewards: List[float] = []
+        metrics_all: List[Dict[str, float]] = []  # 与 rewards 顺序一一对应（扩展后）
+
+        start_time = time.time()
+        programs_per_batch = max(1, self.isaac_num_envs // self.replicas_per_program)
+
+        for batch_start in range(0, num_programs, programs_per_batch):
+            batch_end = min(batch_start + programs_per_batch, num_programs)
+            batch_programs = programs[batch_start:batch_end]
+            batch_size = len(batch_programs)
+
+            num_needed = batch_size
+            should_reset = (not self._envs_ready) or (num_needed > self._last_reset_size)
+            if should_reset:
+                obs = self._isaac_env_pool.reset()
+                self._envs_ready = True
+                self._last_reset_size = self.isaac_num_envs
+            else:
+                obs = self._isaac_env_pool.get_obs()
+
+            total_rewards = torch.zeros(self.isaac_num_envs, device=self.device)
+            done_flags = torch.zeros(self.isaac_num_envs, dtype=torch.bool, device=self.device)
+            done_flags_batch = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+            # 初始化逐分量计算器（匹配 batch_size）
+            if self._step_reward_calc is not None:
+                try:
+                    weights, ks = get_reward_profile(self.reward_profile) if get_reward_profile else ({}, {})
+                    self._step_reward_calc = StepwiseRewardCalculator(weights, ks, dt=self._step_dt, num_envs=batch_size, device=self.device)
+                except Exception:
+                    self._step_reward_calc = None
+            # 记录每个环境累计步数
+            steps_count = torch.zeros(self.isaac_num_envs, device=self.device)
+            ever_nonzero = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+            integral_states = [
+                {
+                    'err_i_x': 0.0, 'err_i_y': 0.0, 'err_i_z': 0.0,
+                    'err_i_roll': 0.0, 'err_i_pitch': 0.0, 'err_i_yaw': 0.0
+                }
+                for _ in range(batch_size)
+            ]
+
+            try:
+                from .segmented_controller import PiLightSegmentedPIDController
+            except ImportError:
+                try:
+                    from utils.segmented_controller import PiLightSegmentedPIDController
+                except ImportError:
+                    PiLightSegmentedPIDController = None  # type: ignore
+            if self.strict_no_prior:
+                controllers = [None for _ in range(batch_size)]
+                use_u_flags = [True for _ in range(batch_size)]
+            else:
+                controllers = []
+                use_u_flags = []
+            # UltraFast 仅在所有程序为常量 set 情况下启用（metrics 评估同理）
+            if self.use_fast_path and self._ultra_executor is not None:
+                try:
+                    if not self._all_programs_const(batch_programs):
+                        self._ultra_executor = None
+                except Exception:
+                    self._ultra_executor = None
+                if PiLightSegmentedPIDController is not None:
+                    for prog in batch_programs:
+                        if self._program_uses_u(prog):
+                            controllers.append(None); use_u_flags.append(True)
+                        else:
+                            controllers.append(
+                                PiLightSegmentedPIDController(
+                                    program=prog,
+                                    suppress_init_print=True,
+                                    semantics='compose_by_gain',
+                                    min_hold_steps=2
+                                )
+                            )
+                            use_u_flags.append(False)
+                else:
+                    controllers = [None for _ in range(batch_size)]
+                    for prog in batch_programs:
+                        use_u_flags.append(self._program_uses_u(prog))
+
+            max_steps = int(self.duration * float(getattr(self, '_control_freq', 48)))
+            min_steps = int(max_steps * self.min_steps_frac)
+            bonus_vec = None
+
+            for step in range(max_steps):
+                t = step * float(getattr(self, '_control_dt', 1.0/48.0))
+                tgt_np = self._target_pos(t)
+                tgt_tensor = torch.tensor(tgt_np, device=self.device, dtype=torch.float32)
+
+                actions = torch.zeros((self.isaac_num_envs, 6), device=self.device)
+                pos = obs['position'][:batch_size]
+                quat = obs['orientation'][:batch_size]
+                vel = obs['velocity'][:batch_size]
+                omega = obs['angular_velocity'][:batch_size]
+
+                # 为简化，这里复用 evaluate_batch 的标准快速路径（不展开全部超快路径细节），
+                # 但保留正确性：逐程序求值生成 u_*。
+                try:
+                    from scipy.spatial.transform import Rotation
+                except ImportError:
+                    Rotation = None
+                if isinstance(pos, torch.Tensor):
+                    pos_np = pos.cpu().numpy(); quat_np = quat.cpu().numpy(); vel_np = vel.cpu().numpy(); omega_np = omega.cpu().numpy()
+                else:
+                    pos_np = np.asarray(pos); quat_np = np.asarray(quat); vel_np = np.asarray(vel); omega_np = np.asarray(omega)
+                tgt_batch = np.tile(tgt_np, (batch_size, 1))
+                pe_batch = tgt_batch - pos_np
+                if Rotation is not None:
+                    try:
+                        rpy_batch = Rotation.from_quat(quat_np).as_euler('XYZ', degrees=False)
+                    except Exception:
+                        rpy_batch = np.zeros((batch_size, 3), dtype=np.float32)
+                else:
+                    rpy_batch = np.zeros((batch_size, 3), dtype=np.float32)
+
+                for i in range(batch_size):
+                    if use_u_flags[i]:
+                        pe = pe_batch[i]; rpy = rpy_batch[i]
+                        state = {
+                            'pos_err_x': float(pe[0]), 'pos_err_y': float(pe[1]), 'pos_err_z': float(pe[2]),
+                            'pos_err': float(np.linalg.norm(pe)), 'pos_err_xy': float(np.linalg.norm(pe[:2])), 'pos_err_z_abs': float(abs(pe[2])),
+                            'vel_x': float(vel_np[i][0]), 'vel_y': float(vel_np[i][1]), 'vel_z': float(vel_np[i][2]), 'vel_err': float(np.linalg.norm(vel_np[i])),
+                            'err_p_roll': float(rpy[0]), 'err_p_pitch': float(rpy[1]), 'err_p_yaw': float(rpy[2]), 'ang_err': float(np.linalg.norm(rpy)), 'rpy_err_mag': float(np.linalg.norm(rpy)),
+                            'ang_vel_x': float(omega_np[i][0]), 'ang_vel_y': float(omega_np[i][1]), 'ang_vel_z': float(omega_np[i][2]), 'ang_vel': float(np.linalg.norm(omega_np[i])), 'ang_vel_mag': float(np.linalg.norm(omega_np[i])),
+                            'err_i_x': float(integral_states[i]['err_i_x']), 'err_i_y': float(integral_states[i]['err_i_y']), 'err_i_z': float(integral_states[i]['err_i_z']),
+                            'err_i_roll': float(integral_states[i]['err_i_roll']), 'err_i_pitch': float(integral_states[i]['err_i_pitch']), 'err_i_yaw': float(integral_states[i]['err_i_yaw']),
+                            'err_d_x': float(-vel_np[i][0]), 'err_d_y': float(-vel_np[i][1]), 'err_d_z': float(-vel_np[i][2]), 'err_d_roll': float(-omega_np[i][0]), 'err_d_pitch': float(-omega_np[i][1]), 'err_d_yaw': float(-omega_np[i][2]),
+                        }
+                        fz, tx, ty, tz = self._eval_program_forces(batch_programs[i], state)
+                        actions[i, 2] = float(fz); actions[i, 3] = float(tx); actions[i, 4] = float(ty); actions[i, 5] = float(tz)
+                        if self.strict_no_prior:
+                            if (abs(fz) > 1e-6) or (abs(tx) > 1e-8) or (abs(ty) > 1e-8) or (abs(tz) > 1e-8):
+                                ever_nonzero[i] = True
+                        if not done_flags[i]:
+                            dt = float(getattr(self, '_control_dt', 1.0/48.0))
+                            integral_states[i]['err_i_x'] += float(pe[0]) * dt
+                            integral_states[i]['err_i_y'] += float(pe[1]) * dt
+                            integral_states[i]['err_i_z'] += float(pe[2]) * dt
+                            integral_states[i]['err_i_roll'] += float(rpy[0]) * dt
+                            integral_states[i]['err_i_pitch'] += float(rpy[1]) * dt
+                            integral_states[i]['err_i_yaw'] += float(rpy[2]) * dt
+                    else:
+                        ctrl = controllers[i]
+                        if ctrl is not None:
+                            rpm, _pos_e, _rpy_e = ctrl.computeControl(
+                                self._control_dt,
+                                cur_pos=pos[i], cur_quat=quat[i], cur_vel=vel[i], cur_ang_vel=omega[i], target_pos=tgt_np,
+                            )
+                            rpm = np.clip(np.asarray(rpm, dtype=np.float32), 0.0, 25000.0)
+                            fz, tx, ty, tz = self._rpm_to_forces_local(rpm)
+                            actions[i, 2] = float(fz); actions[i, 3] = float(tx); actions[i, 4] = float(ty); actions[i, 5] = float(tz)
+                            if self.strict_no_prior:
+                                if (abs(actions[i, 2]) > 1e-6) or (abs(actions[i, 3]) > 1e-8) or (abs(actions[i, 4]) > 1e-8) or (abs(actions[i, 5]) > 1e-8):
+                                    ever_nonzero[i] = True
+
+                # 环境步进
+                obs, step_rewards_env, dones, infos = self._isaac_env_pool.step(actions)
+
+                pos_t = torch.tensor(obs['position'], device=self.device, dtype=torch.float32)
+                vel_t = torch.tensor(obs['velocity'], device=self.device, dtype=torch.float32)
+                omega_t = torch.tensor(obs['angular_velocity'], device=self.device, dtype=torch.float32)
+                # 动态目标：使用 t 对应的目标
+                if self._step_reward_calc is not None:
+                    step_total = self._step_reward_calc.compute_step(
+                        pos_t[:batch_size, :],
+                        tgt_tensor,
+                        vel_t[:batch_size, :],
+                        omega_t[:batch_size, :],
+                        actions[:batch_size, :],
+                        done_flags_batch
+                    )
+                    step_reward = step_total
+                else:
+                    pos_err = pos_t[:batch_size, :] - tgt_tensor
+                    w_pos, w_vel = (2.0, 0.3) if self.trajectory_config.get('type') == 'hover' else (1.0, 0.1)
+                    step_reward = - w_pos * torch.norm(pos_err, dim=1)
+                    step_reward -= w_vel * torch.norm(vel_t[:batch_size, :], dim=1)
+                    act_pen = 1e-7 * torch.sum(actions[:batch_size, :] ** 2, dim=1)
+                    step_reward -= act_pen
+                    crashed = pos_t[:batch_size, 2] < 0.1
+                    step_reward[crashed] -= 5.0
+
+                active_mask = (~done_flags_batch).float()
+                total_rewards[:batch_size] += step_reward * active_mask
+                steps_count[:batch_size] += active_mask
+                done_flags_batch |= dones[:batch_size]
+                done_flags[:batch_size] = done_flags_batch
+                if step >= min_steps and done_flags_batch.all():
+                    break
+
+            # finalize & 额外奖惩
+            if self._step_reward_calc is not None:
+                bonus = self._step_reward_calc.finalize()[:batch_size]
+                total_rewards[:batch_size] += bonus
+                bonus_vec = bonus
+                comp_totals = self._step_reward_calc.get_component_totals()
+            else:
+                bonus_vec = torch.zeros(batch_size, device=self.device)
+                comp_totals = {k: torch.zeros(batch_size, device=self.device) for k in [
+                    'position_rmse','settling_time','control_effort','smoothness_jerk',
+                    'gain_stability','saturation','peak_error','high_freq']}
+
+            # 零动作惩罚
+            if self.strict_no_prior and self.zero_action_penalty > 0:
+                zero_mask = (~ever_nonzero).float()
+                total_rewards[:batch_size] -= self.zero_action_penalty * zero_mask
+
+            # 归约
+            if self.reward_reduction == 'mean':
+                denom = torch.clamp(steps_count[:batch_size], min=1.0)
+                batch_scores = (total_rewards[:batch_size] / denom).cpu().numpy().tolist()
+            else:
+                batch_scores = total_rewards[:batch_size].cpu().numpy().tolist()
+            rewards.extend(batch_scores)
+
+            # 逐环境组件字典（加入 finalize_bonus）
+            comp_totals['finalize_bonus'] = bonus_vec
+            for i in range(batch_size):
+                d = {k: float(comp_totals[k][i].item()) for k in comp_totals.keys()}
+                metrics_all.append(d)
+
+        elapsed = time.time() - start_time
+        display_count = num_programs_original if self.replicas_per_program > 1 else num_programs
+        print(f"[BatchEvaluator] ✅ 评估完成: {display_count} 程序 (×{self.replicas_per_program} replicas), {elapsed:.2f}秒 ({elapsed/display_count*1000:.1f}ms/程序)")
+
+        # 汇总 replicas：对每个原始程序的组件逐键取平均
+        if self.replicas_per_program > 1:
+            averaged_rewards: List[float] = []
+            averaged_metrics: List[Dict[str, float]] = []
+            for i in range(num_programs_original):
+                start_idx = i * self.replicas_per_program
+                end_idx = start_idx + self.replicas_per_program
+                avg_reward = float(np.mean(rewards[start_idx:end_idx]))
+                averaged_rewards.append(avg_reward)
+                # 平均组件
+                keys = list(metrics_all[start_idx].keys())
+                avg_dict = {k: float(np.mean([metrics_all[j][k] for j in range(start_idx, end_idx)])) for k in keys}
+                averaged_metrics.append(avg_dict)
+            return averaged_rewards, averaged_metrics
+
+        return rewards, metrics_all
+
+    def evaluate_single_with_metrics(self, program: List[Dict[str, Any]]) -> Tuple[float, Dict[str, float]]:
+        """评估单个程序（支持 replicas），返回奖励与组件字典。"""
+        rewards, metrics = self.evaluate_batch_with_metrics([program])
+        return rewards[0], metrics[0]
     
     def _compute_action_from_program(self, program: List[Dict[str, Any]], 
                                       obs: np.ndarray, step: int) -> np.ndarray:

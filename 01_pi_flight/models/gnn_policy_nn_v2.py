@@ -200,19 +200,39 @@ class GNNPolicyValueNetV2(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(256, policy_output_dim),
         )
-        # Value head
-        self.value_head = nn.Sequential(
+        # Value head: 多任务输出（总价值标量 + 8个组件向量）
+        # 共享主干
+        self.value_backbone = nn.Sequential(
             nn.Linear(structure_hidden, 512),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(512, 256),
             nn.GELU(),
             nn.Dropout(dropout),
+        )
+        # 总价值头（标量，用于MCTS）
+        self.value_scalar_head = nn.Sequential(
             nn.Linear(256, 1),
             nn.Tanh(),
         )
+        # 组件价值头（8维向量：position/settling/control/smoothness/gain/saturation/peak/high_freq）
+        self.value_components_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 8),  # 8个组件
+            nn.Tanh(),  # 各组件归一化到[-1,1]
+        )
 
-    def forward(self, data: Batch) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, data: Batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        前向传播，返回多任务输出
+        
+        Returns:
+            policy_logits: [B, action_dim] 策略logits
+            value_scalar: [B] 总价值标量（用于MCTS）
+            value_components: [B, 8] 组件价值向量（用于训练梯度密集化）
+        """
         # 1. 结构编码 (得到图嵌入 + 节点嵌入)
         graph_emb, node_emb, batch_index = self.structure_encoder(data)  # [B, H], [N, H]
         # 2. 特征编码 (使用节点嵌入作为序列输入, 产出 CLS token 图特征)
@@ -227,10 +247,40 @@ class GNNPolicyValueNetV2(nn.Module):
         attn_out = self.cross_norm(attn_out + graph_emb)  # 残差 + LN
         # 4. 融合
         fused = self.fuse(torch.cat([attn_out, feature_graph_emb], dim=-1))  # [B, H]
+        # 缓存融合嵌入，供 get_embedding() 使用（用于ranking网络）
+        self._cached_embedding = fused
         # 5. heads 输出
         policy_logits = self.policy_head(fused)
-        value = self.value_head(fused).squeeze(-1)
-        return policy_logits, value
+        # 多任务价值输出
+        value_features = self.value_backbone(fused)  # [B, 256]
+        value_scalar = self.value_scalar_head(value_features).squeeze(-1)  # [B]
+        value_components = self.value_components_head(value_features)  # [B, 8]
+        return policy_logits, value_scalar, value_components
+
+    def get_embedding(self, data: Batch) -> torch.Tensor:
+        """
+        提取程序的嵌入表示（fusion后的128维向量），供ranking网络使用
+        
+        Args:
+            data: PyG Batch对象
+            
+        Returns:
+            embedding: [B, hidden] 融合后的程序嵌入
+        """
+        # 1. 结构编码
+        graph_emb, node_emb, batch_index = self.structure_encoder(data)  # [B, H], [N, H]
+        # 2. 特征编码
+        feature_graph_emb, sequences = self.feature_encoder(node_emb, batch_index)  # [B, H]
+        # 3. 交叉注意力
+        B, H = graph_emb.size()
+        q = graph_emb.unsqueeze(1)  # [B, 1, H]
+        kv = feature_graph_emb.unsqueeze(1)  # [B, 1, H]
+        attn_out, _ = self.cross_attn(q, kv, kv)  # [B, 1, H]
+        attn_out = attn_out.squeeze(1)
+        attn_out = self.cross_norm(attn_out + graph_emb)  # 残差 + LN
+        # 4. 融合（这是我们要提取的嵌入）
+        fused = self.fuse(torch.cat([attn_out, feature_graph_emb], dim=-1))  # [B, H]
+        return fused
 
 # ----------------------------- 工厂函数 ----------------------------- #
 
@@ -286,10 +336,10 @@ def _run_quick_test():
     model = create_gnn_policy_value_net_v2(node_feature_dim=24, policy_output_dim=14).to(device)
     print("模型参数总数:", count_parameters(model))
     t0 = time.time()
-    policy_logits, value = model(batch)
+    policy_logits, value_scalar, value_components = model(batch)
     t1 = time.time()
-    print("前向输出 shapes:", policy_logits.shape, value.shape)
-    loss = policy_logits.mean() + value.mean()
+    print("前向输出 shapes:", policy_logits.shape, value_scalar.shape, value_components.shape)
+    loss = policy_logits.mean() + value_scalar.mean() + value_components.mean()
     loss.backward()
     t2 = time.time()
     total_grad = 0.0
