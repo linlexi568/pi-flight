@@ -20,7 +20,7 @@ import json
 import random
 import copy
 import os
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, TYPE_CHECKING
 from collections import deque
 import numpy as np
 import torch
@@ -40,6 +40,10 @@ from torch_geometric.data import Batch as PyGBatch
 
 # Evaluator
 from utils.batch_evaluation import BatchEvaluator
+
+# MCTS相关（仅用于类型提示）
+if TYPE_CHECKING:
+    from mcts_training.mcts import MCTS_Agent, MCTSNode
 
 
 class PBTAgent:
@@ -335,31 +339,58 @@ class PBTTrainer:
         """所有agent并行训练一步，返回每个agent的奖励"""
         agent_rewards = []
         
-        # TODO: 这里需要实现每个agent的完整训练步骤
-        # 包括：MCTS搜索 -> 生成程序 -> 评估 -> 更新NN
-        
-        # 简化示例（需要完整实现）
-        for agent in self.agents:
-            # 1. 运行MCTS（使用agent的参数）
-            # next_program = agent.trainer.mcts_search(...)
-            
-            # 2. 评估程序
-            # reward = self.evaluator.evaluate_single(next_program)
-            
-            # 3. 添加到replay buffer
-            # agent.replay_buffer.push(sample)
-            
-            # 4. 更新NN（每N轮）
-            # if iteration % agent.args.update_freq == 0:
-            #     agent_train_step(agent)
-            
-            # 临时：随机奖励（测试PBT逻辑）
-            reward = np.random.uniform(-10, 0)
-            agent.performance_history.append(reward)
-            if reward > agent.best_reward:
-                agent.best_reward = reward
-            
-            agent_rewards.append(reward)
+        # 为每个agent执行完整的训练步骤
+        for agent_idx, agent in enumerate(self.agents):
+            try:
+                # 1. MCTS搜索 + 生成新程序
+                current_program = agent.best_program if agent.best_program is not None else self._generate_random_program()
+                
+                # 应用agent的MCTS参数
+                self._apply_agent_mcts_params(agent)
+                
+                # 运行MCTS搜索（使用agent的模型）
+                children, visit_counts = self._mcts_search_for_agent(
+                    agent, current_program, 
+                    num_simulations=agent.mcts_params['simulations']
+                )
+                
+                # 2. 选择下一个程序（根据访问计数）
+                if children and len(visit_counts) > 0:
+                    # 使用temperature采样
+                    next_program = self._select_next_program(children, visit_counts, agent.mcts_params['temperature'])
+                else:
+                    next_program = current_program
+                    print(f"[Agent {agent.id}] 警告: MCTS未生成子节点")
+                
+                # 3. 评估程序
+                reward = self.evaluator.evaluate_single(next_program)
+                
+                # 4. 添加训练样本到replay buffer
+                if children and len(visit_counts) > 0:
+                    self._add_training_sample(agent, current_program, visit_counts, reward)
+                
+                # 5. 更新性能历史
+                agent.performance_history.append(reward)
+                agent.total_iterations += 1
+                
+                if reward > agent.best_reward:
+                    agent.best_reward = reward
+                    agent.best_program = next_program
+                    print(f"[Agent {agent.id}] 🎉 新最佳奖励: {reward:.4f}")
+                
+                # 6. 周期性更新NN
+                if (iteration + 1) % self.args.update_freq == 0 and len(agent.replay_buffer) >= 8:
+                    self._train_agent_nn(agent)
+                
+                agent_rewards.append(reward)
+                
+            except Exception as e:
+                print(f"[Agent {agent.id}] 错误: {e}")
+                import traceback
+                traceback.print_exc()
+                # 失败时使用当前最佳奖励或最低分
+                reward = agent.best_reward if agent.best_reward > -float('inf') else -10.0
+                agent_rewards.append(reward)
         
         return agent_rewards
     
@@ -470,6 +501,228 @@ class PBTTrainer:
             final_path = self.args.save_path.replace('.json', '_pbt_final.json')
             save_program_json(self.global_best_program, final_path)
             print(f"最佳程序已保存: {final_path}")
+    
+    # ============================================================
+    # 辅助方法：agent训练循环相关
+    # ============================================================
+    
+    def _generate_random_program(self):
+        """生成随机初始程序"""
+        from core.dsl import Rule
+        # 简单的PID控制器初始化
+        return [
+            Rule(op='set', var='u_x', expr={'type': 'const', 'value': 0.0}),
+            Rule(op='set', var='u_y', expr={'type': 'const', 'value': 0.0}),
+            Rule(op='set', var='u_z', expr={'type': 'const', 'value': 0.0}),
+        ]
+    
+    def _apply_agent_mcts_params(self, agent: PBTAgent):
+        """应用agent的MCTS参数到全局搜索配置"""
+        # 这些参数会在mcts_search中使用
+        self._current_mcts_params = agent.mcts_params
+    
+    def _mcts_search_for_agent(self, agent: PBTAgent, root_program, num_simulations: int):
+        """为agent执行MCTS搜索"""
+        from mcts_training.mcts import MCTS_Agent, MCTSNode
+        
+        # 创建MCTS实例
+        mcts = MCTS_Agent(
+            evaluator=self.evaluator,
+            exploration_weight=agent.mcts_params['exploration_weight'],
+            max_depth=12  # 固定
+        )
+        
+        # 创建根节点
+        root = MCTSNode(program=root_program, parent=None, depth=0)
+        
+        # MCTS搜索循环（简化版）
+        for sim_idx in range(num_simulations):
+            node = root
+            path = [node]
+            
+            # Selection: 向下选择到叶子节点
+            while node.children and not node.is_terminal():
+                node = self._select_child_puct(node, agent)
+                path.append(node)
+            
+            # Expansion: 如果未完全扩展，扩展一个新子节点
+            if not node.is_fully_expanded() and not node.is_terminal():
+                child = self._expand_node(node, mcts, agent)
+                if child:
+                    path.append(child)
+                    node = child
+            
+            # Simulation: 评估叶子节点
+            reward = self.evaluator.evaluate_single(node.program)
+            
+            # Backpropagation: 回传奖励
+            for n in reversed(path):
+                n.visits += 1
+                n.value_sum += reward
+        
+        # 返回根节点的children和访问计数
+        if root.children:
+            children = root.children
+            visit_counts = [child.visits for child in children]
+            return children, visit_counts
+        else:
+            return [], []
+    
+    def _select_child_puct(self, node: 'MCTSNode', agent: PBTAgent) -> 'MCTSNode':
+        """PUCT选择（使用agent的参数）"""
+        import math
+        
+        best_score = -float('inf')
+        best_child = None
+        
+        puct_c = agent.mcts_params['puct_c']
+        
+        for child in node.children:
+            if child.visits == 0:
+                return child  # 优先选择未访问的
+            
+            # PUCT公式
+            q_value = child.value_sum / child.visits
+            u_value = puct_c * math.sqrt(node.visits) / (1 + child.visits)
+            
+            # 获取prior（如果有）
+            prior = getattr(child, 'prior', 1.0 / len(node.children))
+            u_value *= prior
+            
+            score = q_value + u_value
+            
+            if score > best_score:
+                best_score = score
+                best_child = child
+        
+        return best_child if best_child else node.children[0]
+    
+    def _expand_node(self, node: 'MCTSNode', mcts: 'MCTS_Agent', agent: PBTAgent) -> Optional['MCTSNode']:
+        """扩展节点（创建新子节点）"""
+        from mcts_training.mcts import MCTSNode
+        from core.dsl import mutate_program
+        
+        try:
+            # 生成变异程序
+            mutated_program = mutate_program(node.program)
+            
+            # 创建子节点
+            child = MCTSNode(program=mutated_program, parent=node, depth=node.depth + 1)
+            
+            # 使用GNN获取prior
+            with torch.no_grad():
+                graph = ast_to_pyg_graph(mutated_program)
+                batch_graph = PyGBatch.from_data_list([graph]).to(self.device)
+                policy_logits, _, _ = agent.forward(batch_graph)
+                policy_probs = torch.softmax(policy_logits, dim=-1)
+                # 这里简化：使用第一个edit type的概率作为prior
+                prior = float(policy_probs[0][0].item())
+            
+            child.prior = prior
+            node.children.append(child)
+            
+            return child
+        except Exception as e:
+            print(f"[Agent {agent.id}] 扩展节点失败: {e}")
+            return None
+    
+    def _select_next_program(self, children, visit_counts, temperature: float):
+        """根据访问计数和温度选择下一个程序"""
+        import numpy as np
+        
+        if temperature < 1e-8:
+            # 贪心选择
+            best_idx = np.argmax(visit_counts)
+            return children[best_idx].program
+        else:
+            # 温度采样
+            counts = np.array(visit_counts, dtype=np.float64)
+            scaled = counts ** (1.0 / max(1e-6, temperature))
+            probs = scaled / max(1e-12, scaled.sum())
+            choice = int(np.random.choice(len(children), p=probs))
+            return children[choice].program
+    
+    def _add_training_sample(self, agent: PBTAgent, program, visit_counts, reward):
+        """添加训练样本到agent的replay buffer"""
+        import torch
+        
+        try:
+            # 构建policy target（MCTS访问分布）
+            visit_counts = np.array(visit_counts, dtype=np.float64)
+            policy_target = visit_counts / max(1.0, visit_counts.sum())
+            
+            # 确保target长度与EDIT_TYPES一致
+            full_target = np.zeros(len(EDIT_TYPES), dtype=np.float32)
+            for i in range(min(len(policy_target), len(EDIT_TYPES))):
+                full_target[i] = policy_target[i]
+            
+            # 归一化
+            if full_target.sum() > 0:
+                full_target = full_target / full_target.sum()
+            else:
+                full_target = np.ones(len(EDIT_TYPES), dtype=np.float32) / len(EDIT_TYPES)
+            
+            # 构建样本
+            sample = {
+                'graph': ast_to_pyg_graph(program),
+                'policy_target': torch.tensor(full_target, dtype=torch.float32)
+            }
+            
+            agent.replay_buffer.push(sample)
+            
+        except Exception as e:
+            print(f"[Agent {agent.id}] 添加样本失败: {e}")
+    
+    def _train_agent_nn(self, agent: PBTAgent):
+        """训练agent的神经网络"""
+        if len(agent.replay_buffer) < 8:
+            return
+        
+        try:
+            total_loss = 0.0
+            for _ in range(self.args.train_steps_per_update):
+                # 采样batch
+                actual_batch_size = min(self.args.batch_size, len(agent.replay_buffer))
+                batch = agent.replay_buffer.sample(actual_batch_size)
+                
+                # 构建tensor
+                graph_list = [s['graph'] for s in batch]
+                batch_graph = PyGBatch.from_data_list(graph_list).to(self.device)
+                policy_targets = torch.stack([s['policy_target'] for s in batch]).to(self.device)
+                
+                # 前向传播
+                policy_logits, _, _ = agent.forward(batch_graph)
+                
+                # 策略损失
+                policy_loss = -(policy_targets * torch.nn.functional.log_softmax(policy_logits, dim=-1)).sum(dim=-1).mean()
+                
+                # 熵正则
+                policy_probs = torch.nn.functional.softmax(policy_logits, dim=-1)
+                policy_entropy = (-(policy_probs.clamp(min=1e-12) * policy_probs.clamp(min=1e-12).log()).sum(dim=-1)).mean()
+                
+                loss = policy_loss - 0.01 * policy_entropy
+                
+                # 反向传播
+                agent.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(agent.shared_encoder.parameters()) + list(agent.policy_head.parameters()) 
+                    if agent.shared_encoder is not None 
+                    else agent.nn_model.parameters(),
+                    1.0
+                )
+                agent.optimizer.step()
+                
+                total_loss += loss.item()
+            
+            avg_loss = total_loss / self.args.train_steps_per_update
+            if agent.total_iterations % 10 == 0:  # 每10轮打印一次
+                print(f"[Agent {agent.id}] NN更新: loss={avg_loss:.4f}")
+            
+        except Exception as e:
+            print(f"[Agent {agent.id}] NN训练失败: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def parse_args():
