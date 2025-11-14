@@ -115,6 +115,32 @@ except Exception:
             json.dump({'rules': simplified, 'note': 'Simplified format'}, f, indent=2)
 
 
+def get_program_hash(program):
+    """生成程序的稳定哈希值用于缓存。
+    
+    使用AST序列化后的JSON（排序键）计算blake2s，避免内存地址导致的伪差异，
+    极大提高缓存命中率。
+    
+    Args:
+        program: 程序表示（可以是DSL程序、AST等）
+        
+    Returns:
+        str: 程序的哈希值（16进制字符串）
+    """
+    try:
+        import json, hashlib
+        from core.serialization import to_serializable_dict
+        serial = to_serializable_dict(program)  # {'rules': ...}
+        s = json.dumps(serial, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.blake2s(s.encode('utf-8')).hexdigest()
+    except Exception:
+        # 回退：使用字符串表示（尽量稳定）；失败则使用id（最差情况）
+        try:
+            return str(program)
+        except Exception:
+            return str(id(program))
+
+
 class ReplayBuffer:
     """经验回放缓冲区（支持固定特征和GNN图数据）"""
     
@@ -643,21 +669,7 @@ class OnlineTrainer:
         gnn_prior_cache = self._global_prior_cache      # 引用同一对象
         MAX_CACHE_SIZE = 5000  # 扩大上限，跨迭代可积累更多结构
         
-        def get_program_hash(program):
-            """生成程序的稳定哈希值用于缓存。
-            使用AST序列化后的JSON（排序键）计算blake2s，避免内存地址导致的伪差异，极大提高缓存命中率。
-            """
-            try:
-                import json, hashlib
-                serial = to_serializable_dict(program)  # {'rules': ...}
-                s = json.dumps(serial, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-                return hashlib.blake2s(s.encode('utf-8')).hexdigest()
-            except Exception:
-                # 回退：使用字符串表示（尽量稳定）；失败则使用id（最差情况）
-                try:
-                    return str(program)
-                except Exception:
-                    return str(id(program))
+        # 注意：get_program_hash 现在是顶层函数（在文件开头定义），可以被其他模块导入
         
         def add_to_cache(prog_hash, value):
             """添加/更新缓存（LRU）。超过MAX_CACHE_SIZE时批量淘汰最久未使用的20%。"""
