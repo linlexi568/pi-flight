@@ -54,7 +54,6 @@ def run_short_training(prior_level: int, base_args, iters: int, mcts: int, seed:
         min_steps_frac=0.0,
         reward_reduction='sum',
         use_fast_path=bool(getattr(base_args, 'fast_path', False)),
-        use_dummy_eval=(getattr(base_args, 'mode', 'gym') != 'gym'),
         save_path=f"01_pi_flight/results/ab_best_program_prior{prior_level}.json",
         checkpoint_freq=10**9,
         warm_start=None,
@@ -95,7 +94,6 @@ def main():
     ap.add_argument('--duration', type=int, default=6)
     ap.add_argument('--isaac-num-envs', type=int, default=128)
     ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--mode', type=str, default='gym', choices=['dummy','gym'], help='评估模式: dummy(极快) 或 gym(真实物理)')
     ap.add_argument('--fast-path', action='store_true', help='启用程序求值快速路径以提升真实评估速度')
     ap.add_argument('--prior-levels', type=int, nargs='+', default=[2, 3], help='测试的先验级别列表')
     args = ap.parse_args()

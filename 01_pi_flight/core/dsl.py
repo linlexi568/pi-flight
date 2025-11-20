@@ -1,14 +1,43 @@
 # Copied from 01_pi_light/dsl.py for package rename
 import numpy as np, math, abc
 from collections import deque
+
+SAFE_VALUE_MIN = -6.0
+SAFE_VALUE_MAX = 6.0
+MAX_DELAY_STEPS = 3
+MAX_DIFF_STEPS = 3
+MIN_EMA_ALPHA = 0.05
+MAX_EMA_ALPHA = 0.8
+MAX_RATE_LIMIT = 1.0
+TERMINAL_VALUE_MIN = -3.0
+TERMINAL_VALUE_MAX = 3.0
+MAX_SMOOTH_SCALE = 2.0
+
+def _clamp_value(v: float) -> float:
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return 0.0
+    return float(min(max(v, SAFE_VALUE_MIN), SAFE_VALUE_MAX))
+
+def _safe_get_state(state_dict: dict, key: str) -> float:
+    val = state_dict.get(key, 0.0)
+    if isinstance(val, (int, float)):
+        if math.isnan(val) or math.isinf(val):
+            return 0.0
+        return max(SAFE_VALUE_MIN, min(SAFE_VALUE_MAX, float(val)))
+    return 0.0
 class ProgramNode(abc.ABC):
     def evaluate(self, state_dict: dict) -> float: ...
     def __str__(self): return 'ProgramNode'
 class TerminalNode(ProgramNode):
     def __init__(self,value): self.value=value
     def evaluate(self,state_dict):
-        if isinstance(self.value,str): return state_dict.get(self.value,0.0)
-        return self.value
+        if isinstance(self.value,str): return _safe_get_state(state_dict,self.value)
+        if isinstance(self.value,(int,float)):
+            val=float(self.value)
+            val=max(TERMINAL_VALUE_MIN, min(TERMINAL_VALUE_MAX, val))
+            return val
+        return 0.0
     def __str__(self):
         if isinstance(self.value,float): return f"{self.value:.2f}"; return str(self.value)
 class UnaryOpNode(ProgramNode):
@@ -16,29 +45,32 @@ class UnaryOpNode(ProgramNode):
     def evaluate(self,sd):
         v=self.child.evaluate(sd)
         op = self.op
+        result = None
+
+        def clamp_result(val):
+            return _clamp_value(val)
+
         # 基础一元操作
-        if op=='abs': return abs(v)
-        if op=='sign': return np.sign(v)
-        if op=='sin': return math.sin(v)
-        if op=='cos': return math.cos(v)
+        if op=='abs': return clamp_result(abs(v))
+        if op=='sign': return clamp_result(float(np.sign(v)))
+        if op=='sin': return clamp_result(math.sin(v))
+        if op=='cos': return clamp_result(math.cos(v))
         if op=='tan':
             # 安全裁剪：避免 tan 在奇异点爆炸
             try:
                 val=math.tan(v)
             except Exception:
                 val=0.0
-            if val>10: val=10
-            elif val<-10: val=-10
-            return val
+            return clamp_result(val)
         if op=='log1p':
             # log1p(|v|) 压缩幅度；避免 log(<=0) 问题
             try:
-                return math.log1p(abs(v))
+                return clamp_result(math.log1p(abs(v)))
             except Exception:
                 return 0.0
         if op=='sqrt':
             try:
-                return math.sqrt(abs(v))
+                return clamp_result(math.sqrt(abs(v)))
             except Exception:
                 return 0.0
 
@@ -52,16 +84,17 @@ class UnaryOpNode(ProgramNode):
         # ema:alpha  → y_t = (1-α) y_{t-1} + α v
         if prefix=='ema':
             alpha = float(args[0]) if args else 0.2
+            alpha = min(max(alpha, MIN_EMA_ALPHA), MAX_EMA_ALPHA)
             if not hasattr(self, '_ema_prev'):
                 self._ema_prev = 0.0
             y = (1.0 - alpha) * self._ema_prev + alpha * v
-            self._ema_prev = y
-            return y
+            self._ema_prev = clamp_result(y)
+            return self._ema_prev
 
         # delay:k  → 返回 k 步前的 v
         if prefix=='delay':
             k = int(float(args[0])) if args else 1
-            if k < 1: k = 1
+            k = max(1, min(MAX_DELAY_STEPS, k))
             if not hasattr(self, '_buf'):
                 self._buf = deque(maxlen=k)
             # 若 maxlen 变化，重建缓冲
@@ -70,50 +103,54 @@ class UnaryOpNode(ProgramNode):
             # 读取输出：不足 k 步时返回 0
             out = self._buf[0] if len(self._buf) == k else 0.0
             self._buf.appendleft(v)
-            return float(out)
+            return clamp_result(float(out))
 
         # diff:k  → v - delay(v,k)
         if prefix=='diff':
             k = int(float(args[0])) if args else 1
-            if k < 1: k = 1
+            k = max(1, min(MAX_DIFF_STEPS, k))
             if not hasattr(self, '_buf_d'):
                 self._buf_d = deque(maxlen=k)
             if isinstance(self._buf_d, deque) and self._buf_d.maxlen != k:
                 self._buf_d = deque(list(self._buf_d), maxlen=k)
             prev = self._buf_d[0] if len(self._buf_d) == k else v
             self._buf_d.appendleft(v)
-            return float(v - prev)
+            return clamp_result(float(v - prev))
 
         # clamp:lo:hi  → 限幅
         if prefix=='clamp':
             lo = float(args[0]) if len(args)>=1 else -5.0
             hi = float(args[1]) if len(args)>=2 else 5.0
+            lo = max(SAFE_VALUE_MIN, lo)
+            hi = min(SAFE_VALUE_MAX, hi)
             if lo>hi: lo,hi = hi,lo
             return float(min(max(v, lo), hi))
 
         # deadzone:eps  → 小误差置零
         if prefix=='deadzone':
             eps = float(args[0]) if args else 0.01
+            eps = min(max(0.0, eps), 1.0)
             if abs(v) <= eps: return 0.0
-            return float(v - math.copysign(eps, v))
+            return clamp_result(float(v - math.copysign(eps, v)))
 
         # rate: r  → 斜率限幅（Δt=1）
         if prefix=='rate' or prefix=='rate_limit':
             r = float(args[0]) if args else 1.0
+            r = min(max(0.01, r), MAX_RATE_LIMIT)
             if not hasattr(self, '_rate_prev'):
                 self._rate_prev = 0.0
             y_prev = self._rate_prev
             lo = y_prev - r
             hi = y_prev + r
             y = min(max(v, lo), hi)
-            self._rate_prev = y
-            return float(y)
+            self._rate_prev = clamp_result(y)
+            return self._rate_prev
 
         # smooth:s  → 平滑限幅（tanh 型）
         if prefix=='smooth' or prefix=='smoothstep':
             s = float(args[0]) if args else 1.0
-            s = max(1e-6, s)
-            return float(s * math.tanh(v / s))
+            s = min(max(1e-3, s), MAX_SMOOTH_SCALE)
+            return clamp_result(float(s * math.tanh(v / s)))
 
         raise ValueError('未知的一元操作:'+self.op)
     def __str__(self): return f"{self.op}({self.child})"
@@ -121,23 +158,26 @@ class BinaryOpNode(ProgramNode):
     def __init__(self,op,left,right): self.op=op; self.left=left; self.right=right
     def evaluate(self,sd):
         l=self.left.evaluate(sd); r=self.right.evaluate(sd)
-        if self.op=='+': return l+r
-        if self.op=='-': return l-r
+        if self.op=='+': return _clamp_value(l+r)
+        if self.op=='-': return _clamp_value(l-r)
         if self.op=='/':
             try:
-                return l/ (r if abs(r) > 1e-12 else (1e-12 if r>=0 else -1e-12))
+                val = l/ (r if abs(r) > 1e-6 else (1e-6 if r>=0 else -1e-6))
             except Exception:
-                return 0.0
+                val = 0.0
+            return _clamp_value(val)
         if self.op=='>': return 1.0 if l>r else 0.0
         if self.op=='<': return 1.0 if l<r else 0.0
-        if self.op=='max': return max(l,r)
-        if self.op=='min': return min(l,r)
-        if self.op=='*': return l*r
+        if self.op=='max': return _clamp_value(max(l,r))
+        if self.op=='min': return _clamp_value(min(l,r))
+        if self.op=='*': return _clamp_value(l*r)
         if self.op=='==': return 1.0 if l==r else 0.0
         if self.op=='!=': return 1.0 if l!=r else 0.0
         raise ValueError('未知的二元操作:'+self.op)
     def __str__(self): return f"({self.left} {self.op} {self.right})"
 class IfNode(ProgramNode):
     def __init__(self,condition,then_branch,else_branch): self.condition=condition; self.then_branch=then_branch; self.else_branch=else_branch
-    def evaluate(self,sd): return self.then_branch.evaluate(sd) if self.condition.evaluate(sd)>0 else self.else_branch.evaluate(sd)
+    def evaluate(self,sd):
+        val = self.then_branch.evaluate(sd) if self.condition.evaluate(sd)>0 else self.else_branch.evaluate(sd)
+        return _clamp_value(val)
     def __str__(self): return f"if {self.condition} then ({self.then_branch}) else ({self.else_branch})"

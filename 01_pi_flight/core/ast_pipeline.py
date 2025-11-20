@@ -33,6 +33,18 @@ Program = List[Rule]
 
 ALWAYS_TRUE: ProgramNode = TerminalNode(1.0)
 
+def _is_trivial_condition(node: ProgramNode | None) -> bool:
+    if node is None:
+        return True
+    if isinstance(node, TerminalNode):
+        val = node.value
+        if isinstance(val, (int, float)):
+            try:
+                return float(val) == 1.0
+            except Exception:
+                return False
+    return False
+
 # ---- Helpers to build AST nodes from simple dicts ----
 
 def _ast_from_simple_expr(expr: Any) -> ProgramNode:
@@ -114,16 +126,27 @@ def to_ast_program(program: Program) -> Program:
         try:
             # Case 0: Raw MCTS rule already proper (condition is ProgramNode and actions are BinaryOpNode set)
             if (
-                isinstance(r, dict) and 'condition' in r and 'action' in r and
+                isinstance(r, dict) and 'action' in r and
                 isinstance(r['action'], list) and isinstance(r.get('condition'), ProgramNode) and
                 all(isinstance(a, ProgramNode) for a in r['action'])
             ):
-                ast_rules.append(r)  # safe reuse
+                cond_node = r.get('condition') or ALWAYS_TRUE
+                if _is_trivial_condition(cond_node):
+                    cond_node = ALWAYS_TRUE
+                ast_rules.append({'condition': cond_node, 'action': r['action']})
                 continue
 
             # Case 1: AST structure but with some action/cond still in dict simple form
-            if isinstance(r, dict) and 'condition' in r and 'action' in r and isinstance(r['action'], list):
-                cond_node = r['condition'] if isinstance(r['condition'], ProgramNode) else _ast_from_simple_expr(r['condition'])
+            if isinstance(r, dict) and 'action' in r and isinstance(r['action'], list):
+                cond_raw = r.get('condition')
+                if isinstance(cond_raw, ProgramNode):
+                    cond_node = cond_raw
+                elif cond_raw is None:
+                    cond_node = ALWAYS_TRUE
+                else:
+                    cond_node = _ast_from_simple_expr(cond_raw)
+                if _is_trivial_condition(cond_node):
+                    cond_node = ALWAYS_TRUE
                 acts: List[ProgramNode] = []
                 for a in r['action']:
                     if isinstance(a, ProgramNode):
@@ -187,10 +210,12 @@ def to_serializable_dict(ast_program: Program) -> Dict[str, Any]:
     for r in ast_program:
         cond = r.get('condition', ALWAYS_TRUE)
         acts = r.get('action', []) or []
-        out.append({
-            'condition': serialize_ast(cond),
+        entry = {
             'action': [serialize_ast(a) for a in acts]
-        })
+        }
+        if not _is_trivial_condition(cond):
+            entry['condition'] = serialize_ast(cond)
+        out.append(entry)
     return {'rules': out}
 
 __all__ = ['to_ast_program','to_serializable_dict','has_u_set']

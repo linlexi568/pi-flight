@@ -14,6 +14,7 @@
 - 使用学习到的排序分数引导MCTS
 """
 from __future__ import annotations
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -212,14 +213,163 @@ def compute_ranking_loss(
         device=device
     )  # [B, 6]
     
-    # 批量GNN编码
-    batch_a = PyGBatch.from_data_list(graphs_a).to(device)
-    batch_b = PyGBatch.from_data_list(graphs_b).to(device)
+    # 🔧 验证并修复图结构（确保边索引有效）
+    def ensure_valid_graph(graph):
+        """
+        确保图的边索引有效，避免GATv2Conv断言失败
+        
+        常见问题：
+        1. 没有边 -> 添加自环
+        2. 边索引超出节点范围 -> 添加自环
+        3. 孤立节点 -> 通过 add_self_loops 确保每个节点至少有一条边
+        """
+        from torch_geometric.utils import add_self_loops, remove_self_loops
+        
+        num_nodes = graph.x.size(0)
+        edge_index = graph.edge_index
+        
+        # 检查是否有边
+        if edge_index is None or edge_index.numel() == 0 or edge_index.size(1) == 0:
+            # 没有边：添加自环
+            graph.edge_index = torch.stack([
+                torch.arange(num_nodes, dtype=torch.long, device=graph.x.device),
+                torch.arange(num_nodes, dtype=torch.long, device=graph.x.device)
+            ], dim=0)
+            return graph
+        
+        # 确保edge_index在正确的设备上
+        if edge_index.device != graph.x.device:
+            edge_index = edge_index.to(graph.x.device)
+            graph.edge_index = edge_index
+        
+        # 检查边索引是否有效
+        try:
+            min_idx = edge_index.min().item()
+            max_idx = edge_index.max().item()
+            
+            # 边索引超出范围或包含负数
+            if min_idx < 0 or max_idx >= num_nodes:
+                print(f"[Ranking] ⚠️ 边索引越界: min={min_idx}, max={max_idx}, num_nodes={num_nodes}，重建为自环")
+                graph.edge_index = torch.stack([
+                    torch.arange(num_nodes, dtype=torch.long, device=graph.x.device),
+                    torch.arange(num_nodes, dtype=torch.long, device=graph.x.device)
+                ], dim=0)
+                return graph
+            
+            # 检查边索引形状
+            if edge_index.size(0) != 2:
+                print(f"[Ranking] ⚠️ 边索引形状错误: {edge_index.shape}，重建为自环")
+                graph.edge_index = torch.stack([
+                    torch.arange(num_nodes, dtype=torch.long, device=graph.x.device),
+                    torch.arange(num_nodes, dtype=torch.long, device=graph.x.device)
+                ], dim=0)
+                return graph
+            
+            # 🔧 关键修复：使用PyG的add_self_loops确保每个节点至少有一条边
+            # 这解决了孤立节点导致 GATv2Conv alpha=None 的问题
+            edge_index, _ = remove_self_loops(edge_index)
+            edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+            graph.edge_index = edge_index
+                
+        except Exception as e:
+            print(f"[Ranking] ⚠️ 边索引验证失败: {e}，重建为自环")
+            graph.edge_index = torch.stack([
+                torch.arange(num_nodes, dtype=torch.long, device=graph.x.device),
+                torch.arange(num_nodes, dtype=torch.long, device=graph.x.device)
+            ], dim=0)
+        
+        return graph
     
-    # 提取嵌入
-    with torch.no_grad():
-        embed_a = gnn_encoder.get_embedding(batch_a)
-        embed_b = gnn_encoder.get_embedding(batch_b)
+    graphs_a = [ensure_valid_graph(g) for g in graphs_a]
+    graphs_b = [ensure_valid_graph(g) for g in graphs_b]
+    
+    from torch_geometric.utils import remove_self_loops, add_self_loops, coalesce
+
+    def _build_batch(graph_list, target_device=None):
+        target = target_device or device
+        batch = PyGBatch.from_data_list(graph_list).to(target)
+        if batch.edge_index is None:
+            return batch
+        num_nodes = int(batch.x.size(0))
+        if num_nodes == 0:
+            return batch
+        edge_index, _ = remove_self_loops(batch.edge_index)
+        edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+        batch.edge_index = coalesce(edge_index, num_nodes=num_nodes)
+        return batch
+
+    def _initial_chunk_limit(total_graphs: int) -> int:
+        env_val = os.getenv('RANKING_GNN_CHUNK')
+        if env_val is not None:
+            try:
+                limit = max(1, int(env_val))
+            except ValueError:
+                limit = 4
+        else:
+            limit = 4 if device.type == 'cuda' else total_graphs
+        return max(1, min(total_graphs, limit))
+
+    def _encode_on_cpu(graphs: List, tag: str) -> torch.Tensor:
+        cpu_device = torch.device('cpu')
+        prev_device = next(gnn_encoder.parameters()).device
+        was_training = gnn_encoder.training
+        print(f"[Ranking] ⚠️ 触发CPU fallback({tag})：graphs={len(graphs)}, nodes≈{sum(g.x.size(0) for g in graphs)}")
+        gnn_encoder.eval()
+        gnn_encoder.to(cpu_device)
+        embeddings = []
+        try:
+            for start in range(0, len(graphs)):
+                chunk = graphs[start:start + 1]
+                batch = _build_batch(chunk, cpu_device)
+                with torch.no_grad():
+                    embed = gnn_encoder.get_embedding(batch)
+                embeddings.append(embed.detach().float())
+        finally:
+            gnn_encoder.to(prev_device)
+            gnn_encoder.train(was_training)
+        concatenated = torch.cat(embeddings, dim=0)
+        return concatenated.to(device)
+
+    def _encode_graphs(graphs: List, tag: str) -> torch.Tensor:
+        if not graphs:
+            raise ValueError("encode_graphs received empty list")
+        chunk_size = _initial_chunk_limit(len(graphs))
+        was_training = gnn_encoder.training
+        gnn_encoder.eval()
+        try:
+            while True:
+                embeddings = []
+                try:
+                    for start in range(0, len(graphs), chunk_size):
+                        chunk = graphs[start:start + chunk_size]
+                        batch = _build_batch(chunk)
+                        with torch.no_grad():
+                            if device.type == 'cuda':
+                                with torch.cuda.amp.autocast(dtype=torch.float16):
+                                    embed = gnn_encoder.get_embedding(batch)
+                            else:
+                                embed = gnn_encoder.get_embedding(batch)
+                        embeddings.append(embed.detach().float())
+                    return torch.cat(embeddings, dim=0)
+                except torch.cuda.OutOfMemoryError as oom:
+                    if device.type != 'cuda':
+                        raise
+                    prev_chunk = chunk_size
+                    chunk_size = max(1, chunk_size // 2)
+                    print(f"[Ranking] ⚠️ CUDA OOM({tag})：chunk {prev_chunk}→{chunk_size}. nodes≈{sum(g.x.size(0) for g in graphs)}")
+                    torch.cuda.empty_cache()
+                    if prev_chunk == 1:
+                        return _encode_on_cpu(graphs, tag)
+                except Exception as e:
+                    print(f"[Ranking] ⚠️ GNN编码失败({tag}): {e}")
+                    print(f"  graphs样本: nodes={[g.x.size(0) for g in graphs[:3]]}, edges={[g.edge_index.size(1) for g in graphs[:3]]}")
+                    raise
+                # chunk_size==1且成功会在for循环 return；若降到1后OOM，将在上面raise
+        finally:
+            gnn_encoder.train(was_training)
+
+    embed_a = _encode_graphs(graphs_a, 'A')
+    embed_b = _encode_graphs(graphs_b, 'B')
     
     # 比较（传入动作特征）
     logits = ranking_net.forward_compare(embed_a, embed_b, action_feats_a, action_feats_b)

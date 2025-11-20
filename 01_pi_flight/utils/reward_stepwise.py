@@ -86,7 +86,11 @@ class StepwiseRewardCalculator:
         active = ~done_mask  # bool
         active_f = active.float()
         # 位置误差
-        pos_err = torch.norm(pos - target.view(1,3), dim=1)  # [N]
+        if target.dim() == 1:
+            target_expanded = target.view(1, 3)
+        else:
+            target_expanded = target
+        pos_err = torch.norm(pos - target_expanded, dim=1)  # [N]
         self.max_pos_err = torch.maximum(self.max_pos_err, pos_err)
         # 误差趋势 (settling proxy): 如果当前误差 < 上一步误差则奖励 +delta
         delta_err = self.prev_pos_err - pos_err

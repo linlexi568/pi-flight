@@ -10,7 +10,7 @@ echo "=========================================="
 # Configuration
 TIMESTEPS=1000000
 N_ENVS=8
-SAVE_DIR="./results"
+SAVE_DIR="./02_PPO/results"
 
 # Create results directory
 mkdir -p "$SAVE_DIR"

@@ -3,163 +3,380 @@
 PPO Baseline for Drone Control
 使用Stable-Baselines3实现,作为黑盒NN baseline对比
 """
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+# 添加项目根目录到路径
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_ROOT = _SCRIPT_DIR.parent
+sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / '01_pi_flight'))
+
+# Isaac Gym 必须在 torch 之前导入
+_GYM_PATH = _ROOT / 'isaacgym' / 'python'
+if _GYM_PATH.exists():
+    sys.path.insert(0, str(_GYM_PATH))
+    try:
+        from isaacgym import gymapi
+    except ImportError:
+        print("[WARNING] Isaac Gym 未安装，PPO 训练可能无法运行")
 
 import numpy as np
 import torch
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-import argparse
-from pathlib import Path
 
-# 导入你的环境评估器
-import sys
-sys.path.append(str(Path(__file__).parent))
-from batch_evaluation import BatchEvaluator
+# 导入 π-Flight 的组件
+try:
+    from envs.isaac_gym_drone_env import IsaacGymDroneEnv
+    from utils.reward_stepwise import StepwiseRewardCalculator
+    from utilities.reward_profiles import get_reward_profile
+except ImportError as e:
+    print(f"[ERROR] 导入失败: {e}")
+    raise
 
-
-class DroneControlEnv(gym.Env):
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+class _FixedConfig:
     """
-    将你的Isaac Gym环境包装成Gym接口
+    Hardcoded configuration for PPO baseline.
+    Edit this class to change parameters.
+    NO CLI ARGUMENTS ALLOWED.
     """
-    def __init__(self, task='circle', render=False):
-        super().__init__()
-        
-        self.task = task
-        
-        # 观察空间: 根据你的DSL变量定义
-        # 假设使用12维状态 (pos_err_xyz, vel_xyz, ang_vel_xyz, rpy_err)
-        obs_dim = 12
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
-        )
-        
-        # 动作空间: 直接输出控制量 u_tx, u_ty, u_tz
-        # 归一化到[-1, 1]
-        action_dim = 3
-        self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32
-        )
-        
-        # 初始化评估器 (单环境版本)
-        self.evaluator = BatchEvaluator(
-            num_envs=1,  # PPO训练时每个worker只用1个环境
-            device='cuda',
-            task=task
-        )
-        
-        self.max_steps = 300  # 每个episode最大步数
-        self.current_step = 0
-        self.state = None
-        
-    def reset(self):
-        """重置环境"""
-        self.current_step = 0
-        # 从评估器获取初始状态
-        self.state = self.evaluator.reset()
-        return self._get_obs()
+    # --- Experiment ---
+    mode = 'train'  # 'train' or 'test'
+    experiment_name = 'ppo_baseline_v1'
+    seed = 42
     
-    def _get_obs(self):
-        """提取观察值 (12维状态向量)"""
-        # 根据你的环境实现,提取相关状态
-        # 示例: pos_err, vel, ang_vel, rpy_err
-        obs = np.array([
-            self.state['pos_err_x'],
-            self.state['pos_err_y'],
-            self.state['pos_err_z'],
-            self.state['vel_x'],
-            self.state['vel_y'],
-            self.state['vel_z'],
-            self.state['ang_vel_x'],
-            self.state['ang_vel_y'],
-            self.state['ang_vel_z'],
-            self.state['err_p_roll'],
-            self.state['err_p_pitch'],
-            self.state['err_p_yaw'],
-        ], dtype=np.float32)
+    # --- Environment ---
+    task = 'figure8'  # 'hover', 'figure8', 'circle', 'helix'
+    duration = 10.0   # seconds per episode
+    isaac_num_envs = 512  # Number of parallel environments in Isaac Gym
+    
+    # --- Reward ---
+    # Options: 'safety_first', 'tracking_first', 'balanced', 'robustness_stability'
+    reward_profile = 'balanced'
+    
+    # --- Training ---
+    total_timesteps = 1_000_000
+    learning_rate = 3e-4
+    n_steps = 2048        # Steps per update per env
+    batch_size = 64
+    n_epochs = 10
+    gamma = 0.99
+    gae_lambda = 0.95
+    clip_range = 0.2
+    ent_coef = 0.0
+    
+    # --- System ---
+    device = 'cuda:0'  # 'cpu' or 'cuda:0'
+    
+    # --- Trajectory Params (matches BatchEvaluator defaults) ---
+    traj_params = {
+        'figure8': {'A': 0.8, 'B': 0.5, 'period': 12.0},
+        'circle': {'R': 0.9, 'period': 10.0},
+        'helix': {'R': 0.7, 'period': 10.0, 'v_z': 0.15},
+        'hover': {}
+    }
+
+    @property
+    def trajectory_config(self):
+        return {
+            'type': self.task,
+            'params': self.traj_params.get(self.task, {}),
+            'initial_xyz': [0.0, 0.0, 1.0]
+        }
+
+# -----------------------------------------------------------------------------
+# Environment Wrapper
+# -----------------------------------------------------------------------------
+class DroneControlEnv(VecEnv):
+    """
+    VecEnv wrapper for IsaacGymDroneEnv to be compatible with Stable-Baselines3.
+    Manages 512 parallel environments directly.
+    """
+    def __init__(self, cfg: _FixedConfig):
+        self.cfg = cfg
+        self.device = torch.device(cfg.device)
+        self.num_envs = cfg.isaac_num_envs
+        
+        # Define spaces (Gymnasium)
+        # Action: [u_fz, u_tx, u_ty, u_tz] in [-1, 1]
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
+        # Observation: [pos_err(3), vel(3), ang_vel(3), rpy_err(3)] -> 12 dims
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32)
+        
+        # Initialize VecEnv
+        super().__init__(self.num_envs, self.observation_space, self.action_space)
+        
+        # Initialize Isaac Gym Environment
+        print(f"[PPO Env] Initializing IsaacGymDroneEnv with {self.num_envs} envs...")
+        self.env_pool = IsaacGymDroneEnv(
+            num_envs=self.num_envs,
+            device=cfg.device,
+            headless=True,
+            duration_sec=cfg.duration
+        )
+        
+        # Initialize Reward Calculator
+        weights, ks = get_reward_profile(cfg.reward_profile)
+        # Estimate dt from env control freq (usually 48Hz)
+        try:
+            self.control_freq = self.env_pool.control_freq
+        except:
+            self.control_freq = 48.0
+        self.dt = 1.0 / self.control_freq
+        
+        self.reward_calc = StepwiseRewardCalculator(
+            weights, ks, dt=self.dt, num_envs=self.num_envs, device=cfg.device
+        )
+        
+        # State tracking
+        self.env_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.actions_buf = None
+        
+        # Initial reset
+        self.env_pool.reset()
+        self.reward_calc.reset_components()
+        
+    def step_async(self, actions):
+        # Store actions for step_wait
+        # Actions from SB3 are numpy arrays, convert to tensor
+        self.actions_buf = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
+
+    def step_wait(self):
+        # 1. Scale actions
+        # PPO output [-1, 1] -> Physical units
+        # u_fz * 20.0 -> [-20, 20] N
+        # u_tau * 10.0 -> [-10, 10] Nm
+        
+        u_fz = self.actions_buf[:, 0] * 20.0
+        u_tx = self.actions_buf[:, 1] * 10.0
+        u_ty = self.actions_buf[:, 2] * 10.0
+        u_tz = self.actions_buf[:, 3] * 10.0
+        
+        # 2. Prepare forces for IsaacGymDroneEnv [0, 0, fz, tx, ty, tz]
+        # Note: IsaacGymDroneEnv expects [N, 6]
+        zeros = torch.zeros((self.num_envs, 2), device=self.device)
+        forces_6d = torch.stack([
+            torch.zeros(self.num_envs, device=self.device), # fx
+            torch.zeros(self.num_envs, device=self.device), # fy
+            u_fz,
+            u_tx,
+            u_ty,
+            u_tz
+        ], dim=1)
+        
+        # 3. Step Physics
+        # obs_terminal is the state AFTER physics step, but BEFORE reset (if done)
+        obs_terminal_dict, _, dones, _ = self.env_pool.step(forces_6d)
+        
+        # 4. Calculate Rewards
+        # Calculate targets for each env based on its current step count
+        t = self.env_steps.float() * self.dt
+        targets = self._compute_targets(t) # [N, 3]
+        
+        # Extract state tensors
+        pos = torch.as_tensor(obs_terminal_dict['position'], device=self.device)
+        vel = torch.as_tensor(obs_terminal_dict['velocity'], device=self.device)
+        quat = torch.as_tensor(obs_terminal_dict['orientation'], device=self.device)
+        omega = torch.as_tensor(obs_terminal_dict['angular_velocity'], device=self.device)
+        
+        # Compute reward
+        rewards = self.reward_calc.compute_step(
+            pos=pos,
+            target=targets,
+            vel=vel,
+            omega=omega,
+            actions=forces_6d, # Pass 6D forces
+            done_mask=dones # Dones from this step
+        )
+        
+        # 5. Handle Resets and Observations
+        # Update steps
+        self.env_steps += 1
+        
+        # If done, reset steps for those envs
+        if dones.any():
+            reset_ids = torch.nonzero(dones).squeeze(-1)
+            self.env_steps[reset_ids] = 0
+            
+            # Get current (reset) observations
+            obs_reset_dict = self.env_pool.get_obs()
+            final_obs_dict = obs_reset_dict
+        else:
+            final_obs_dict = obs_terminal_dict
+            
+        # 6. Format Observations for PPO [N, 12]
+        final_obs_tensor = self._format_obs(final_obs_dict, t if not dones.any() else self.env_steps.float() * self.dt)
+        
+        # 7. Construct Infos (Terminal observations)
+        infos = [{} for _ in range(self.num_envs)]
+        if dones.any():
+            # Format terminal obs
+            term_obs_tensor = self._format_obs(obs_terminal_dict, t)
+            
+            done_indices = torch.nonzero(dones).squeeze(-1).cpu().numpy()
+            for idx in done_indices:
+                infos[idx]['terminal_observation'] = term_obs_tensor[idx].cpu().numpy()
+                infos[idx]['TimeLimit.truncated'] = (self.env_steps[idx] >= (self.cfg.duration / self.dt)) # Approx check
+        
+        return final_obs_tensor.cpu().numpy(), rewards.cpu().numpy(), dones.cpu().numpy(), infos
+
+    def _compute_targets(self, t_tensor: torch.Tensor) -> torch.Tensor:
+        # Vectorized target computation
+        # t_tensor: [N]
+        traj = self.cfg.trajectory_config
+        tp = traj['type']
+        init = torch.tensor(traj['initial_xyz'], device=self.device)
+        params = traj['params']
+        
+        if tp == 'hover':
+            return init.expand(self.num_envs, 3)
+        elif tp == 'figure8':
+            A = float(params.get('A', 0.8))
+            B = float(params.get('B', 0.5))
+            period = float(params.get('period', 12.0))
+            w = 2.0 * np.pi / period
+            
+            x = A * torch.sin(w * t_tensor)
+            y = B * torch.sin(w * t_tensor) * torch.cos(w * t_tensor)
+            z = torch.zeros_like(t_tensor)
+            
+            delta = torch.stack([x, y, z], dim=1)
+            return init + delta
+        # Add other types if needed
+        return init.expand(self.num_envs, 3)
+
+    def _format_obs(self, obs_dict, t_tensor):
+        # Convert dict obs to [N, 12] vector
+        # [pos_err(3), vel(3), ang_vel(3), rpy_err(3)]
+        
+        pos = torch.as_tensor(obs_dict['position'], device=self.device)
+        vel = torch.as_tensor(obs_dict['velocity'], device=self.device)
+        quat = torch.as_tensor(obs_dict['orientation'], device=self.device)
+        omega = torch.as_tensor(obs_dict['angular_velocity'], device=self.device)
+        
+        # Target
+        target_pos = self._compute_targets(t_tensor)
+        pos_err = pos - target_pos
+        
+        # RPY Error (Simplified: assume target RPY is 0 for now, or just feed RPY)
+        rpy = self._quat_to_rpy(quat)
+        
+        # Obs: [pos_err, vel, omega, rpy]
+        obs = torch.cat([pos_err, vel, omega, rpy], dim=1)
         return obs
-    
-    def step(self, action):
-        """执行一步"""
-        self.current_step += 1
+
+    def _quat_to_rpy(self, q):
+        # q: [N, 4] (x, y, z, w)
+        x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
         
-        # 将归一化的动作[-1,1]映射到实际控制量
-        # 假设控制量范围是[-10, 10]
-        action_scaled = action * 10.0
+        # Roll
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        roll = torch.atan2(sinr_cosp, cosr_cosp)
         
-        # 应用动作,获取下一个状态和奖励
-        next_state, reward, info = self.evaluator.step(action_scaled)
-        self.state = next_state
+        # Pitch
+        sinp = 2 * (w * y - z * x)
+        pitch = torch.where(torch.abs(sinp) >= 1, torch.sign(sinp) * (np.pi / 2), torch.asin(sinp))
         
-        # 判断是否结束
-        done = (self.current_step >= self.max_steps) or info.get('crashed', False)
+        # Yaw
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = torch.atan2(siny_cosp, cosy_cosp)
         
-        return self._get_obs(), reward, done, info
-    
+        return torch.stack([roll, pitch, yaw], dim=1)
+
+    def reset(self):
+        self.env_pool.reset()
+        self.env_steps.zero_()
+        self.reward_calc.reset_components()
+        
+        obs_dict = self.env_pool.get_obs()
+        t = torch.zeros(self.num_envs, device=self.device)
+        return self._format_obs(obs_dict, t).cpu().numpy()
+
     def close(self):
-        """清理资源"""
-        if hasattr(self, 'evaluator'):
-            del self.evaluator
+        self.env_pool.close()
 
+    def env_is_wrapped(self, wrapper_class, indices=None):
+        if indices is None:
+            n = self.num_envs
+        else:
+            n = len(indices)
+        return [False] * n
 
-def make_env(task='circle', rank=0):
-    """创建环境的工厂函数 (用于并行)"""
-    def _init():
-        env = DroneControlEnv(task=task)
-        env = Monitor(env)  # 记录统计信息
-        return env
-    return _init
+    def env_method(self, method_name, *method_args, indices=None, **method_kwargs):
+        return [None] * self.num_envs
+
+    def get_attr(self, attr_name, indices=None):
+        if hasattr(self, attr_name):
+            val = getattr(self, attr_name)
+            if indices is None:
+                n = self.num_envs
+            else:
+                n = len(indices)
+            return [val] * n
+        return [None] * self.num_envs
+
+    def set_attr(self, attr_name, value, indices=None):
+        setattr(self, attr_name, value)
 
 
 def train_ppo_baseline(
-    task='circle',
+    trajectory='figure8',
+    duration=10,
+    isaac_num_envs=512,
+    reward_profile='balanced',
     total_timesteps=1_000_000,
-    n_envs=8,
-    save_dir='./ppo_baseline',
+    n_envs=1, # Ignored, using isaac_num_envs internally
+    save_dir='./02_PPO/results',
     eval_freq=10000,
 ):
     """
     训练PPO baseline
-    
-    Args:
-        task: 任务类型 ('circle', 'figure8', 'hover_wind')
-        total_timesteps: 总训练步数
-        n_envs: 并行环境数
-        save_dir: 模型保存目录
-        eval_freq: 评估频率
     """
-    print(f"[PPO Baseline] 开始训练 - 任务: {task}")
-    print(f"[PPO Baseline] 总步数: {total_timesteps:,}, 并行环境: {n_envs}")
+    print(f"[PPO Baseline] 开始训练")
+    print(f"  轨迹: {trajectory}, 时长: {duration}s")
+    print(f"  奖励 profile: {reward_profile}")
+    print(f"  总步数: {total_timesteps:,}")
+    print(f"  Isaac 并行环境: {isaac_num_envs}")
     
     # 创建保存目录
-    save_path = Path(save_dir) / task
+    save_path = Path(save_dir) / f"{trajectory}_{reward_profile}"
     save_path.mkdir(parents=True, exist_ok=True)
     
-    # 创建并行环境
-    if n_envs > 1:
-        env = SubprocVecEnv([make_env(task, i) for i in range(n_envs)])
-    else:
-        env = DummyVecEnv([make_env(task)])
+    # 创建配置对象
+    cfg = _FixedConfig()
+    cfg.task = trajectory
+    cfg.duration = duration
+    cfg.isaac_num_envs = isaac_num_envs
+    cfg.reward_profile = reward_profile
     
-    # 创建评估环境
-    eval_env = DummyVecEnv([make_env(task)])
+    # 创建环境 (VecEnv)
+    env = DroneControlEnv(cfg)
     
     # 定义PPO模型
-    # 使用标准超参数 (可以根据需要调整)
     model = PPO(
         policy='MlpPolicy',
         env=env,
         learning_rate=3e-4,
         n_steps=2048,          # 每次更新收集的步数
-        batch_size=64,
+        batch_size=4096,       # Batch size for PPO update (larger for Isaac)
         n_epochs=10,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,         # 熵系数 (鼓励探索)
+        ent_coef=0.01,
         vf_coef=0.5,
         max_grad_norm=0.5,
         verbose=1,
@@ -167,19 +384,8 @@ def train_ppo_baseline(
         device='cuda',
     )
     
-    # 设置回调
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=str(save_path / 'best_model'),
-        log_path=str(save_path / 'eval_logs'),
-        eval_freq=eval_freq,
-        deterministic=True,
-        render=False,
-        n_eval_episodes=10,
-    )
-    
     checkpoint_callback = CheckpointCallback(
-        save_freq=50000,
+        save_freq=50000 // isaac_num_envs,
         save_path=str(save_path / 'checkpoints'),
         name_prefix='ppo_model',
     )
@@ -188,7 +394,7 @@ def train_ppo_baseline(
     print("[PPO Baseline] 开始训练...")
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[eval_callback, checkpoint_callback],
+        callback=[checkpoint_callback],
         progress_bar=True,
     )
     
@@ -199,60 +405,94 @@ def train_ppo_baseline(
     
     # 清理
     env.close()
-    eval_env.close()
     
     return model, save_path
 
 
-def evaluate_ppo_baseline(model_path, task='circle', n_eval=100):
+def evaluate_ppo_baseline(
+    model_path,
+    trajectory='figure8',
+    duration=10,
+    isaac_num_envs=512,
+    reward_profile='balanced',
+    n_eval=100
+):
     """
     评估训练好的PPO模型
-    
-    Args:
-        model_path: 模型路径
-        task: 任务类型
-        n_eval: 评估episode数
-    
-    Returns:
-        平均奖励, 标准差
     """
     print(f"[PPO Baseline] 评估模型: {model_path}")
+    print(f"  轨迹: {trajectory}, profile: {reward_profile}")
     
     # 加载模型
     model = PPO.load(model_path)
     
+    # 创建配置
+    cfg = _FixedConfig()
+    cfg.task = trajectory
+    cfg.duration = duration
+    cfg.isaac_num_envs = isaac_num_envs
+    cfg.reward_profile = reward_profile
+    
     # 创建评估环境
-    env = DummyVecEnv([make_env(task)])
+    env = DroneControlEnv(cfg)
     
     # 运行评估
-    episode_rewards = []
-    episode_lengths = []
+    # 由于是 VecEnv，我们一次评估 isaac_num_envs 个 episode
+    # 我们运行 n_eval // isaac_num_envs 次 batch
     
-    for i in range(n_eval):
+    n_batches = max(1, n_eval // isaac_num_envs)
+    all_rewards = []
+    all_lengths = []
+    
+    for i in range(n_batches):
         obs = env.reset()
-        done = False
-        episode_reward = 0
-        episode_length = 0
+        # VecEnv reset returns obs
         
-        while not done:
+        # Track rewards per env
+        current_rewards = np.zeros(isaac_num_envs)
+        current_lengths = np.zeros(isaac_num_envs)
+        dones = np.zeros(isaac_num_envs, dtype=bool)
+        
+        # Run until all done? No, Isaac runs continuously.
+        # We run for fixed duration or until done.
+        # Let's run for duration steps.
+        max_steps = int(duration / env.dt)
+        
+        for step in range(max_steps):
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, info = env.step(action)
-            episode_reward += reward
-            episode_length += 1
+            obs, rewards, step_dones, infos = env.step(action)
+            
+            # Accumulate rewards for non-done envs
+            # If done, the reward returned is for the last step.
+            # We should add it.
+            
+            # Note: if an env is already done in this batch, we shouldn't count it again?
+            # But Isaac auto-resets.
+            # Let's just collect first episode from each env.
+            
+            active = ~dones
+            current_rewards[active] += rewards[active]
+            current_lengths[active] += 1
+            
+            # Update dones
+            new_dones = step_dones & active
+            dones = dones | step_dones
+            
+            if dones.all():
+                break
         
-        episode_rewards.append(episode_reward)
-        episode_lengths.append(episode_length)
+        all_rewards.extend(current_rewards)
+        all_lengths.extend(current_lengths)
         
-        if (i + 1) % 10 == 0:
-            print(f"  Episode {i+1}/{n_eval}: Reward={episode_reward:.3f}")
+        print(f"  Batch {i+1}/{n_batches}: Mean Reward={np.mean(current_rewards):.3f}")
     
     env.close()
     
-    mean_reward = np.mean(episode_rewards)
-    std_reward = np.std(episode_rewards)
-    mean_length = np.mean(episode_lengths)
+    mean_reward = np.mean(all_rewards)
+    std_reward = np.std(all_rewards)
+    mean_length = np.mean(all_lengths)
     
-    print(f"\n[PPO Baseline] 评估结果 ({n_eval} episodes):")
+    print(f"\n[PPO Baseline] 评估结果 ({len(all_rewards)} episodes):")
     print(f"  平均奖励: {mean_reward:.3f} ± {std_reward:.3f}")
     print(f"  平均长度: {mean_length:.1f}")
     
@@ -260,65 +500,50 @@ def evaluate_ppo_baseline(model_path, task='circle', n_eval=100):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='PPO Baseline for Drone Control')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval'],
-                        help='训练或评估模式')
-    parser.add_argument('--task', type=str, default='circle',
-                        choices=['circle', 'figure8', 'hover_wind'],
-                        help='任务类型')
-    parser.add_argument('--timesteps', type=int, default=1_000_000,
-                        help='总训练步数')
-    parser.add_argument('--n-envs', type=int, default=8,
-                        help='并行环境数')
-    parser.add_argument('--save-dir', type=str, default='./ppo_baseline',
-                        help='模型保存目录')
-    parser.add_argument('--model-path', type=str, default=None,
-                        help='评估时的模型路径')
-    parser.add_argument('--n-eval', type=int, default=100,
-                        help='评估episode数')
+    """主入口 - 使用固定配置运行"""
+    cfg = _FixedConfig
     
-    args = parser.parse_args()
+    print("=" * 80)
+    print("PPO Baseline 训练/评估")
+    print("=" * 80)
+    print(f"模式: {cfg.mode}")
+    print(f"任务: {cfg.task} (轨迹={cfg.task}, 时长={cfg.duration}s)")
+    print(f"奖励 profile: {cfg.reward_profile}")
+    print("=" * 80)
+    print()
     
-    if args.mode == 'train':
+    if cfg.mode == 'train':
         train_ppo_baseline(
-            task=args.task,
-            total_timesteps=args.timesteps,
-            n_envs=args.n_envs,
-            save_dir=args.save_dir,
+            trajectory=cfg.task,
+            duration=cfg.duration,
+            isaac_num_envs=cfg.isaac_num_envs,
+            reward_profile=cfg.reward_profile,
+            total_timesteps=cfg.total_timesteps,
+            n_envs=1,
+            save_dir='./02_PPO/results',
+            eval_freq=10000,
         )
     
-    elif args.mode == 'eval':
-        if args.model_path is None:
-            args.model_path = f"{args.save_dir}/{args.task}/final_model"
-        
+    elif cfg.mode == 'eval':
+        # Find model path
+        model_path = f"./02_PPO/results/{cfg.task}_{cfg.reward_profile}/final_model"
+        if not os.path.exists(model_path + ".zip"):
+             print(f"Model not found at {model_path}")
+             return
+
         evaluate_ppo_baseline(
-            model_path=args.model_path,
-            task=args.task,
-            n_eval=args.n_eval,
+            model_path=model_path,
+            trajectory=cfg.task,
+            duration=cfg.duration,
+            isaac_num_envs=cfg.isaac_num_envs,
+            reward_profile=cfg.reward_profile,
+            n_eval=100,
         )
+    
+    else:
+        raise ValueError(f"Unknown mode: {cfg.mode}")
 
 
 if __name__ == '__main__':
     main()
 
-
-# ============================================================================
-# 使用示例
-# ============================================================================
-
-"""
-# 1. 训练PPO (circle任务)
-python baseline_ppo.py --mode train --task circle --timesteps 1000000 --n-envs 8
-
-# 2. 评估训练好的模型
-python baseline_ppo.py --mode eval --task circle --n-eval 100
-
-# 3. 在多个任务上训练
-for task in circle figure8 hover_wind; do
-    python baseline_ppo.py --mode train --task $task --timesteps 1000000
-done
-
-# 4. 对比你的方法 vs PPO
-python compare_methods.py --your-result results/circle_best.json \
-                          --ppo-result ppo_baseline/circle/eval_logs/evaluations.npz
-"""

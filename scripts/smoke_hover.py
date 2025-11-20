@@ -21,12 +21,14 @@ try:
         sys.modules['piflight'] = pkg
 
     # Load DSL and controller modules
-    spec = importlib.util.spec_from_file_location('piflight.dsl', os.path.join(root, '01_pi_flight', 'dsl.py'))
+    spec = importlib.util.spec_from_file_location('piflight.dsl', os.path.join(root, '01_pi_flight', 'core', 'dsl.py'))
     dsl = importlib.util.module_from_spec(spec)
+    sys.modules['piflight.dsl'] = dsl  # Register in sys.modules so relative imports work
     spec.loader.exec_module(dsl)  # type: ignore
 
-    spec2 = importlib.util.spec_from_file_location('piflight.program_executor', os.path.join(root, '01_pi_flight', 'program_executor.py'))
+    spec2 = importlib.util.spec_from_file_location('piflight.program_executor', os.path.join(root, '01_pi_flight', 'core', 'program_executor.py'))
     pe = importlib.util.module_from_spec(spec2)
+    sys.modules['piflight.program_executor'] = pe  # Register in sys.modules
     spec2.loader.exec_module(pe)  # type: ignore
 
     spec3 = importlib.util.spec_from_file_location('utilities.isaac_tester', os.path.join(root, 'utilities', 'isaac_tester.py'))

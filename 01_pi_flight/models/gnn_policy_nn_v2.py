@@ -23,6 +23,7 @@ python 01_pi_flight/gnn_policy_nn_v2.py  # 将运行自检 (随机图) 并打印
 from __future__ import annotations
 import math
 import time
+import threading
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -33,6 +34,7 @@ import torch.nn.functional as F
 try:
     from torch_geometric.nn import GATv2Conv, global_mean_pool
     from torch_geometric.data import Data, Batch
+    from torch_geometric.utils import add_self_loops, remove_self_loops, coalesce
 except ImportError:
     raise ImportError("需要安装 torch-geometric 才能使用该模块。")
 
@@ -65,7 +67,7 @@ class StructureEncoder(nn.Module):
         super().__init__()
         self.proj_in = nn.Linear(in_dim, hidden_dim)
         self.layers = nn.ModuleList()
-        # GATv2Conv 参数: out_channels 指单头输出,总输出= out_channels * heads
+        # 🔧 恢复 GATv2Conv，但添加健壮的边索引处理
         out_per_head = hidden_dim // heads
         for i in range(num_layers):
             conv = GATv2Conv(
@@ -74,21 +76,42 @@ class StructureEncoder(nn.Module):
                 heads=heads,
                 dropout=dropout,
                 edge_dim=None,
-                add_self_loops=True,
+                add_self_loops=False,  # 手动添加自环以确保正确性
                 share_weights=False,
             )
             self.layers.append(conv)
         self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
         self.dropout = nn.Dropout(dropout)
+        # GATv2Conv 在 forward 内部通过 self._alpha 暂存注意力，不是线程安全的；
+        # 异步训练+MCTS 并发访问时需要锁以避免 alpha=None 断言。
+        self._conv_lock = threading.Lock()
 
     def forward(self, data: Batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # 输入节点特征: x [N_total, in_dim]
         x = self.proj_in(data.x)  # [N, hidden]
-        for conv, ln in zip(self.layers, self.norms):
-            # GATv2Conv 输出维度 = out_per_head * heads = hidden_dim
-            h = conv(x, data.edge_index)
-            # 残差 + 层归一化
-            x = ln(x + self.dropout(F.elu(h)))
+        edge_index = data.edge_index
+        num_nodes = x.size(0)
+        
+        # 🔧 关键修复：确保每个节点都有自环
+        # GATv2Conv要求每个节点至少有一条边（否则alpha=None）
+        # 策略：使用PyG的add_self_loops，它会正确处理批次索引
+        from torch_geometric.utils import add_self_loops, remove_self_loops, coalesce
+        
+        # 先移除可能的自环，避免重复
+        edge_index, _ = remove_self_loops(edge_index)
+        
+        # 使用PyG的add_self_loops，它会自动为0到num_nodes-1的所有节点添加自环
+        edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+        
+        # 确保边索引去重并排序（coalesce会合并重复边）
+        edge_index = coalesce(edge_index, num_nodes=num_nodes)
+        
+        with self._conv_lock:
+            for conv, ln in zip(self.layers, self.norms):
+                # GATv2Conv 现在保证每个节点都有边，不会导致 alpha=None
+                h = conv(x, edge_index)
+                # 残差 + 层归一化
+                x = ln(x + self.dropout(F.elu(h)))
         # 图级池化
         graph_emb = global_mean_pool(x, data.batch)  # [B, hidden]
         return graph_emb, x, data.batch

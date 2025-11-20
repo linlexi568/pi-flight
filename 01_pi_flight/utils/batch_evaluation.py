@@ -2,11 +2,14 @@
 
 仅支持Isaac Gym批量并行仿真（512+ 环境）
 """
-from typing import List, Dict, Any, Tuple
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
+import hashlib
 import time
 
 # Isaac Gym检测（尝试从本仓库的 vendor 目录加载）
+# ⚠️ CRITICAL: Isaac Gym必须在torch导入前初始化
 import sys, pathlib, os
 ISAAC_GYM_AVAILABLE = False
 try:
@@ -32,6 +35,8 @@ except Exception:
     except Exception:
         ISAAC_GYM_AVAILABLE = False
 
+# ⚠️ CRITICAL: torch必须在Isaac Gym之后导入
+import torch
 
 # Stepwise 奖励计算器与权重
 try:
@@ -47,9 +52,95 @@ except Exception:
     except Exception:
         StepwiseRewardCalculator = None  # type: ignore
 try:
+    from utils.gpu_program_executor import GPUProgramExecutor  # type: ignore
+except Exception:
+    try:
+        from gpu_program_executor import GPUProgramExecutor  # type: ignore
+    except Exception:
+        GPUProgramExecutor = None  # type: ignore
+try:
     from utilities.reward_profiles import get_reward_profile  # type: ignore
 except Exception:
     get_reward_profile = None  # type: ignore
+try:
+    from utils.prior_scoring import compute_prior_scores  # type: ignore
+except Exception:
+    try:
+        import sys, pathlib
+        _parent = pathlib.Path(__file__).resolve().parent.parent
+        if str(_parent) not in sys.path:
+            sys.path.insert(0, str(_parent))
+        from utils.prior_scoring import compute_prior_scores  # type: ignore
+    except Exception:
+        compute_prior_scores = None  # type: ignore
+
+try:
+    # 用于结构化序列化程序，生成稳定哈希
+    from core.serialization import to_serializable_dict as _to_serializable_dict  # type: ignore
+except Exception:
+    _to_serializable_dict = None  # type: ignore
+
+try:
+    from core.serialization import serialize_program as _serialize_program  # type: ignore
+except Exception:
+    _serialize_program = None  # type: ignore
+
+
+@dataclass
+class ProgramParamCandidate:
+    """轻量级 BO 候选，延迟注入参数 & 延迟构造 DSL AST。"""
+
+    base_program: List[Dict[str, Any]]
+    param_paths: Tuple[str, ...]
+    param_values: Tuple[float, ...]
+    cache_key: Optional[str] = None
+    allow_cache: bool = False
+    _materialized: Optional[List[Dict[str, Any]]] = None
+
+    def materialize(self) -> List[Dict[str, Any]]:
+        if self._materialized is None:
+            import copy
+            try:
+                from utils.bayesian_tuner import inject_tuned_params  # type: ignore
+            except ImportError:
+                from .bayesian_tuner import inject_tuned_params  # type: ignore
+            prog_copy = copy.deepcopy(self.base_program)
+            tuned_values = {path: self.param_values[idx] for idx, path in enumerate(self.param_paths)}
+            inject_tuned_params(prog_copy, tuned_values)
+            self._materialized = prog_copy
+        return self._materialized
+
+
+def _normalize_program_structure_for_cache(obj: Any):
+    """递归去除程序内的常数值，仅保留结构信息用于缓存键。
+
+    - 所有 dict 中 key 为 'value' 的数值会被占位符替换；
+    - 其他任意 int/float 也统一替换，确保结构相同即命中缓存；
+    - 其余类型保持不变。
+    """
+    if isinstance(obj, dict):
+        normalized = {}
+        for k, v in obj.items():
+            if k == 'value' and isinstance(v, (int, float)):
+                normalized[k] = '<CONST>'
+            else:
+                normalized[k] = _normalize_program_structure_for_cache(v)
+        return normalized
+    if isinstance(obj, list):
+        return [_normalize_program_structure_for_cache(item) for item in obj]
+    if isinstance(obj, (int, float)):
+        return '<CONST>'
+    return obj
+
+try:
+    from utils.program_constraints import validate_program, HARD_CONSTRAINT_PENALTY
+except Exception:
+    try:
+        from program_constraints import validate_program, HARD_CONSTRAINT_PENALTY  # type: ignore
+    except Exception:
+        def validate_program(_program):  # type: ignore
+            return True, ""
+        HARD_CONSTRAINT_PENALTY = -1e6  # type: ignore
 
 
 class BatchEvaluator:
@@ -67,8 +158,23 @@ class BatchEvaluator:
                  strict_no_prior: bool = True,
                  zero_action_penalty: float = 5.0,
                  use_fast_path: bool = True,
+                 use_gpu_expression_executor: bool = True,
                  complexity_bonus: float = 0.1,
-                 action_scale_multiplier: float = 1.0):
+                 action_scale_multiplier: float = 1.0,
+                 structure_prior_weight: float = 0.0,
+                 stability_prior_weight: float = 0.0,
+                 enable_output_mad: bool = True,
+                 mad_min_fz: float = 0.0,
+                 mad_max_fz: float = 7.5,
+                 mad_max_xy: float = 0.12,
+                 mad_max_yaw: float = 0.04,
+                 mad_max_delta_fz: float = 1.5,
+                 mad_max_delta_xy: float = 0.03,
+                 mad_max_delta_yaw: float = 0.02,
+                 enable_bayesian_tuning: bool = False,
+                 bo_batch_size: int = 50,
+                 bo_iterations: int = 3,
+                 bo_param_ranges: Optional[Dict[str, Tuple[float, float]]] = None):
         """
         Args:
             trajectory_config: 轨迹配置 {'type': 'figure8', 'params': {...}}
@@ -81,6 +187,12 @@ class BatchEvaluator:
             reward_profile: 奖励配置文件名称
             zero_action_penalty: 零动作惩罚 (优化后默认5.0)
             complexity_bonus: 复杂度奖励系数 (每个唯一变量+0.1, 每条规则+0.05*bonus)
+            structure_prior_weight: 结构先验加成权重（0=关闭）
+            stability_prior_weight: 稳定性先验加成权重（0=关闭）
+            enable_bayesian_tuning: 是否启用贝叶斯优化对程序常数进行调参
+            bo_batch_size: BO每次并行评估的参数组数
+            bo_iterations: BO迭代次数
+            bo_param_ranges: 参数范围字典 {'const': (min, max), ...}
         """
         # 保险起见：运行期再尝试一次导入
         global ISAAC_GYM_AVAILABLE
@@ -131,6 +243,20 @@ class BatchEvaluator:
             self.action_scale_multiplier = float(action_scale_multiplier)
         except Exception:
             self.action_scale_multiplier = 1.0
+
+        self.structure_prior_weight = float(structure_prior_weight)
+        self.stability_prior_weight = float(stability_prior_weight)
+
+        # MAD（Magnitude-Angle-Delta）安全壳参数
+        self.enable_output_mad = bool(enable_output_mad)
+        self.mad_min_fz = float(mad_min_fz)
+        self.mad_max_fz = float(mad_max_fz)
+        self.mad_max_xy = float(abs(mad_max_xy))
+        self.mad_max_yaw = float(abs(mad_max_yaw))
+        self.mad_max_delta_fz = float(abs(mad_max_delta_fz))
+        self.mad_max_delta_xy = float(abs(mad_max_delta_xy))
+        self.mad_max_delta_yaw = float(abs(mad_max_delta_yaw))
+        self._mad_eps = 1e-6
         
         # 初始化 Stepwise 奖励计算器（使用 control_law_discovery 权重）
         try:
@@ -141,6 +267,9 @@ class BatchEvaluator:
         except Exception:
             self._step_reward_calc = None
 
+        # 记录最近一次安全裁剪后的 [fz, tx, ty, tz]
+        self._last_safe_actions = torch.zeros((self.isaac_num_envs, 4), device=self.device)
+
         # Isaac Gym环境池（延迟初始化）
         self._isaac_env_pool = None
         self._envs_ready = False  # 环境池持久化标记
@@ -149,6 +278,22 @@ class BatchEvaluator:
         # 🚀 快速路径优化
         self.use_fast_path = use_fast_path
         self._program_cache = {}  # 预编译缓存: {prog_hash: (fz,tx,ty,tz)}
+        disable_gpu_env = os.getenv('DISABLE_GPU_EXPRESSION', '').lower()
+        if disable_gpu_env in ('1', 'true', 'yes'):
+            use_gpu_expression_executor = False
+        self.use_gpu_expression_executor = bool(use_gpu_expression_executor)
+        self._gpu_executor = None
+        if self.use_gpu_expression_executor and GPUProgramExecutor is not None:
+            try:
+                self._gpu_executor = GPUProgramExecutor(device=self.device)
+                print("[BatchEvaluator] ✅ GPU表达式执行器已启用")
+            except Exception as gpu_exc:
+                self._gpu_executor = None
+                self.use_gpu_expression_executor = False
+                print(f"[BatchEvaluator] ⚠️ GPU表达式执行器初始化失败，回退CPU: {gpu_exc}")
+        elif self.use_gpu_expression_executor:
+            print("[BatchEvaluator] ⚠️ GPUProgramExecutor 不可用，回退CPU")
+            self.use_gpu_expression_executor = False
         
         # 🚀🚀 超高性能执行器 (完全向量化 + JIT)
         if use_fast_path:
@@ -164,17 +309,74 @@ class BatchEvaluator:
                     self._ultra_executor = None
         else:
             self._ultra_executor = None
+            # 清理可能残留的编译缓存
+            if hasattr(self, '_compiled_forces'):
+                delattr(self, '_compiled_forces')
+        
+        # 🔥 贝叶斯优化调参模块
+        self.enable_bayesian_tuning = bool(enable_bayesian_tuning)
+        self.bo_batch_size = int(bo_batch_size)
+        self.bo_iterations = int(bo_iterations)
+        self.bo_param_ranges = bo_param_ranges or {'default': (-3.0, 3.0)}
+        self._bo_tuner = None  # 延迟创建（因为依赖程序实际参数）
+        # 程序评估结果缓存：避免对完全相同的程序重复仿真
+        self._eval_cache: Dict[str, float] = {}
+        self._eval_cache_limit: int = 5000
         
         print(f"[BatchEvaluator] 初始化完成")
         print(f"  - Isaac Gym: {'✅ 启用' if ISAAC_GYM_AVAILABLE else '❌ 未启用'}")
         print(f"  - 并行环境数: {self.isaac_num_envs}")
         print(f"  - GPU设备: {self.device}")
         print(f"  - 单程序副本数: {self.replicas_per_program}")
+        if self.enable_bayesian_tuning:
+            print(f"  - 贝叶斯调参: ✅ 启用 (batch={self.bo_batch_size}, iters={self.bo_iterations})")
         print(f"  - 最小步数比例: {self.min_steps_frac}")
         print(f"  - 奖励归约: {self.reward_reduction}")
         print(f"  - 严格无先验(u_*直接控制): {'✅ 是' if self.strict_no_prior else '❌ 否'}")
         if self.strict_no_prior:
             print(f"  - 零动作惩罚: {self.zero_action_penalty}")
+
+    # ---------------------- 程序评估缓存辅助 ----------------------
+    def _program_eval_key(self, program: List[Dict[str, Any]]) -> str:
+        """生成稳定的程序键，用于评估缓存。
+
+        使用 core.serialization.to_serializable_dict 的 JSON 表示，再做 blake2s 哈希；
+        若不可用则退化为 str(program)。
+        """
+        if isinstance(program, ProgramParamCandidate):
+            if not program.allow_cache:
+                return None
+            if program.cache_key:
+                return program.cache_key
+
+        try:
+            import json
+            if isinstance(program, ProgramParamCandidate):
+                base_prog = program.base_program
+                if _serialize_program is not None:
+                    serial_source = _serialize_program(base_prog)  # type: ignore
+                elif _to_serializable_dict is not None:
+                    serial_source = _to_serializable_dict(base_prog)
+                else:
+                    serial_source = base_prog
+            elif _serialize_program is not None:
+                serial_source = _serialize_program(program)  # type: ignore
+            elif _to_serializable_dict is not None:
+                serial_source = _to_serializable_dict(program)
+            else:
+                serial_source = program
+            serial = _normalize_program_structure_for_cache(serial_source)
+            s = json.dumps(serial, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            digest = hashlib.blake2s(s.encode("utf-8")).hexdigest()
+            if isinstance(program, ProgramParamCandidate):
+                program.cache_key = digest
+            return digest
+        except Exception:
+            try:
+                return str(program)
+            except Exception:
+                return str(id(program))
+
     
     def _init_isaac_gym_pool(self):
         """延迟初始化Isaac Gym环境池"""
@@ -220,6 +422,290 @@ class BatchEvaluator:
         self._control_dt = 1.0 / float(self._control_freq)
         
         print(f"[BatchEvaluator] ✅ Isaac Gym环境池就绪（{self.isaac_num_envs} 环境）")
+
+    # ---------------------- 贝叶斯优化调参模块 ----------------------
+    def _batch_tune_programs_with_bo(self, programs: List[List[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
+        """🚀 真正的批量贝叶斯优化：对多个程序同时进行 GP-UCB 迭代优化
+        
+        核心改进（相比之前的Sobol采样）：
+        1. 使用 Gaussian Process 建模参数空间
+        2. 每轮迭代根据 UCB 采集函数智能选择下一批候选
+        3. 所有程序的候选仍然批量并行评估（利用Isaac Gym）
+        
+        工作流程：
+        - Iteration 1: 初始化采样（Sobol）→ 批量评估 → 更新 GP
+        - Iteration 2+: UCB 选择候选 → 批量评估 → 更新 GP
+        - 最终：每个程序返回最佳参数
+        
+        Args:
+            programs: 待调优的程序列表
+            
+        Returns:
+            tuned_programs: 调优后的程序列表
+        """
+        try:
+            from utils.bayesian_tuner import (
+                BayesianTuner, ParameterSpec, 
+                extract_tunable_params, inject_tuned_params
+            )
+        except ImportError:
+            print("[BatchEvaluator] Warning: BayesianTuner not available, skipping BO")
+            return programs
+        
+        # 禁用递归BO
+        old_bo_flag = self.enable_bayesian_tuning
+        self.enable_bayesian_tuning = False
+        
+        try:
+            # 🔧 第一步：为每个程序初始化独立的 BayesianTuner
+            program_tuners = []  # [(prog_idx, tuner, params), ...]
+            param_paths_map: Dict[int, Tuple[str, ...]] = {}
+            cache_key_map: Dict[int, Optional[str]] = {}
+            
+            for prog_idx, program in enumerate(programs):
+                params = extract_tunable_params(program)
+                if not params:
+                    # 无参数，跳过BO
+                    program_tuners.append((prog_idx, None, None))
+                    param_paths_map[prog_idx] = tuple()
+                    cache_key_map[prog_idx] = self._program_eval_key(program)
+                    continue
+                
+                # 定义参数空间
+                param_specs = []
+                for path, init_value in params:
+                    if 'default' in self.bo_param_ranges:
+                        low, high = self.bo_param_ranges['default']
+                    else:
+                        low = init_value - 2.0
+                        high = init_value + 2.0
+                    param_specs.append(ParameterSpec(name=path, low=low, high=high, log_scale=False))
+                
+                param_paths = tuple(path for path, _ in params)
+                param_paths_map[prog_idx] = param_paths
+                cache_key_map[prog_idx] = self._program_eval_key(program)
+                
+                # 创建 BayesianTuner 实例
+                tuner = BayesianTuner(
+                    param_specs=param_specs,
+                    batch_size=self.bo_batch_size,
+                    n_iterations=self.bo_iterations,
+                    ucb_kappa=2.0,
+                    random_seed=hash(str(program)) % (2**31)
+                )
+                program_tuners.append((prog_idx, tuner, params))
+            
+            # 🔧 第二步：迭代式批量BO（真正的 Bayesian Optimization）
+            import time as time_module
+            bo_start_time = time_module.time()
+            print(f"[BatchEvaluator] 🧠 真实BO: {len([t for t in program_tuners if t[1] is not None])} 个程序, "
+                  f"{self.bo_iterations} 轮迭代, {self.bo_batch_size} 个候选/轮")
+            
+            for iter_idx in range(self.bo_iterations):
+                iter_start_time = time_module.time()
+                # 2.1 收集本轮所有程序的候选参数
+                all_candidates = []  # [(prog_idx, candidate_program), ...]
+                candidate_metadata = []  # [(prog_idx, X_raw_row), ...] 用于更新GP
+                gen_start_time = time_module.time()
+                
+                for prog_idx, tuner, params in program_tuners:
+                    if tuner is None:
+                        # 无参数程序，只在第一轮添加一次
+                        if iter_idx == 0:
+                            all_candidates.append((prog_idx, programs[prog_idx]))
+                            candidate_metadata.append((prog_idx, None))
+                        continue
+                    
+                    # 生成候选：第一轮用Sobol，后续用UCB
+                    if iter_idx == 0:
+                        X_norm = tuner._sobol_sample(tuner.batch_size)
+                    else:
+                        X_norm = tuner._select_next_batch()
+                    
+                    X_raw = tuner._denormalize(X_norm)
+                    
+                    # 为每组参数创建程序副本
+                    param_paths = param_paths_map.get(prog_idx, tuple())
+                    for i in range(len(X_raw)):
+                        param_values = tuple(float(X_raw[i, j]) for j in range(len(param_paths)))
+                        candidate = ProgramParamCandidate(
+                            base_program=programs[prog_idx],
+                            param_paths=param_paths,
+                            param_values=param_values,
+                        )
+                        all_candidates.append((prog_idx, candidate))
+                        candidate_metadata.append((prog_idx, X_raw[i]))
+                
+                gen_time = time_module.time() - gen_start_time
+                print(f"[BO] 第{iter_idx+1}轮候选生成完成: {len(all_candidates)}个程序 | 耗时{gen_time:.1f}秒 (含deepcopy)")
+
+                # 📊 统计当前轮候选中独特的结构模板数量（忽略常数）
+                if all_candidates:
+                    structure_keys = set()
+                    for _, cand_prog in all_candidates:
+                        base_prog = cand_prog.base_program if isinstance(cand_prog, ProgramParamCandidate) else cand_prog
+                        try:
+                            key = self._program_eval_key(base_prog)
+                        except Exception:
+                            key = None
+                        if key is not None:
+                            structure_keys.add(key)
+                    unique_structures = len(structure_keys) if structure_keys else len(all_candidates)
+                    print(f"[BO] 第{iter_idx+1}轮结构覆盖: {unique_structures}/{len(all_candidates)} unique templates")
+                
+                # 2.2 批量评估所有候选
+                if not all_candidates:
+                    break
+                    
+                all_candidate_programs = [prog for _, prog in all_candidates]
+                eval_start_time = time_module.time()
+                all_rewards = self.evaluate_batch(all_candidate_programs)
+                eval_time = time_module.time() - eval_start_time
+                print(f"[BO] 第{iter_idx+1}轮评估完成: {len(all_candidate_programs)}个候选 | 耗时{eval_time:.1f}秒")
+                
+                # 2.3 更新每个程序的 GP 模型
+                for idx, ((prog_idx, _), reward) in enumerate(zip(all_candidates, all_rewards)):
+                    _, tuner, _ = program_tuners[prog_idx]
+                    if tuner is None:
+                        continue
+                    
+                    # 获取对应的参数值
+                    X_raw_row = candidate_metadata[idx][1]
+                    if X_raw_row is not None:
+                        X_norm_row = tuner._normalize(X_raw_row.reshape(1, -1))
+                        tuner.X_history.append(X_norm_row)
+                        tuner.y_history.append(np.array([reward]))
+                
+                # 2.4 拟合 GP（为下一轮做准备）
+                if iter_idx < self.bo_iterations - 1:  # 最后一轮不需要拟合
+                    gp_start_time = time_module.time()
+                    for prog_idx, tuner, _ in program_tuners:
+                        if tuner is not None and tuner.X_history:
+                            X_all = np.vstack(tuner.X_history)
+                            y_all = np.concatenate(tuner.y_history)
+                            tuner.gp.fit(X_all, y_all)
+                    gp_time = time_module.time() - gp_start_time
+                    print(f"[BO] GP模型拟合完成: {len([t for t in program_tuners if t[1] is not None])}个模型 | 耗时{gp_time:.2f}秒")
+                
+                iter_time = time_module.time() - iter_start_time
+                print(f"[BO] 第{iter_idx+1}轮完成 | 总耗时{iter_time:.1f}秒")
+            
+            # 🔧 第三步：为每个程序选择最佳参数
+            tuned_programs = []
+            for prog_idx, tuner, params in program_tuners:
+                if tuner is None or not tuner.y_history:
+                    # 无参数或BO失败，保留原程序
+                    tuned_programs.append(programs[prog_idx])
+                    continue
+                
+                # 找到最佳参数
+                y_all = np.concatenate(tuner.y_history)
+                best_idx = np.argmax(y_all)
+                X_all = np.vstack(tuner.X_history)
+                best_X_norm = X_all[best_idx]
+                best_X_raw = tuner._denormalize(best_X_norm.reshape(1, -1))[0]
+                
+                # 注入最佳参数
+                import copy
+                tuned_prog = copy.deepcopy(programs[prog_idx])
+                param_dict = {params[j][0]: best_X_raw[j] for j in range(len(params))}
+                inject_tuned_params(tuned_prog, param_dict)
+                tuned_programs.append(tuned_prog)
+            
+            bo_total_time = time_module.time() - bo_start_time
+            print(f"[BatchEvaluator] ✅ 真实BO完成: {len(tuned_programs)} 个程序已通过GP-UCB优化 | 总耗时{bo_total_time:.1f}秒")
+            
+            return tuned_programs
+            
+        finally:
+            self.enable_bayesian_tuning = old_bo_flag
+    
+    def _tune_program_with_bo(self, program: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], float]:
+        """对单个程序使用贝叶斯优化调整常数参数
+        
+        Args:
+            program: 原始程序（包含初始参数）
+            
+        Returns:
+            tuned_program: 调优后的程序
+            best_reward: 对应的最佳奖励
+        """
+        try:
+            from utils.bayesian_tuner import (
+                BayesianTuner, ParameterSpec, 
+                extract_tunable_params, inject_tuned_params
+            )
+        except ImportError:
+            print("[BatchEvaluator] Warning: BayesianTuner not available, skipping BO")
+            return program, float('-inf')
+        
+        # 1. 提取可调参数
+        params = extract_tunable_params(program)
+        if not params:
+            # 没有常数参数，无需调优
+            return program, float('-inf')
+        
+        # 2. 定义参数空间
+        param_specs = []
+        for path, init_value in params:
+            # 根据初始值或全局配置确定范围
+            if 'default' in self.bo_param_ranges:
+                low, high = self.bo_param_ranges['default']
+            else:
+                # 自适应：以初始值为中心，±2倍范围
+                low = init_value - 2.0
+                high = init_value + 2.0
+            
+            param_specs.append(ParameterSpec(
+                name=path,
+                low=low,
+                high=high,
+                log_scale=False
+            ))
+        
+        # 3. 定义评估函数（🚀 批量并行优化：一次评估所有候选参数）
+        def eval_fn(X_batch):
+            """X_batch: [bo_batch_size, n_params]"""
+            import copy
+            batch_size = len(X_batch)
+            
+            # 🚀 关键优化：批量构造所有候选程序（避免串行循环）
+            all_programs = []
+            for i in range(batch_size):
+                prog_copy = copy.deepcopy(program)
+                param_dict = {params[j][0]: X_batch[i, j] for j in range(len(params))}
+                inject_tuned_params(prog_copy, param_dict)
+                all_programs.append(prog_copy)
+            
+            # 🚀 一次性评估所有程序（利用 Isaac Gym 4096 并行环境）
+            # 禁用递归 BO 避免无限循环
+            old_bo_flag = self.enable_bayesian_tuning
+            self.enable_bayesian_tuning = False
+            try:
+                rewards = self.evaluate_batch(all_programs)  # ✅ 批量并行评估
+            finally:
+                self.enable_bayesian_tuning = old_bo_flag
+            
+            return np.array(rewards)
+        
+        # 4. 运行 BO
+        tuner = BayesianTuner(
+            param_specs=param_specs,
+            batch_size=min(self.bo_batch_size, self.isaac_num_envs),
+            n_iterations=self.bo_iterations,
+            ucb_kappa=2.0,
+            random_seed=hash(str(program)) % 2**31
+        )
+        
+        best_params, best_reward = tuner.optimize(eval_fn, verbose=False)
+        
+        # 5. 注入最佳参数
+        import copy
+        tuned_program = copy.deepcopy(program)
+        param_dict = {params[j][0]: best_params[j] for j in range(len(params))}
+        inject_tuned_params(tuned_program, param_dict)
+        
+        return tuned_program, best_reward
 
     # ---------------------- DSL 辅助：AST 求值与动作解析 ----------------------
     def _ast_eval(self, node, state: Dict[str, float]) -> float:
@@ -324,6 +810,162 @@ class BatchEvaluator:
             return False
         return False
 
+    def _compute_prior_bonus(self, programs: List[List[Dict[str, Any]]]):
+        if compute_prior_scores is None:
+            return None
+        if (abs(self.structure_prior_weight) < 1e-9 and
+                abs(self.stability_prior_weight) < 1e-9):
+            return None
+        batch_size = len(programs)
+        if batch_size == 0:
+            return None
+        structure_tensor = torch.zeros(batch_size, device=self.device)
+        stability_tensor = torch.zeros(batch_size, device=self.device)
+        for idx, prog in enumerate(programs):
+            try:
+                scores = compute_prior_scores(prog)
+                structure_tensor[idx] = float(scores.get('structure', 0.0))
+                stability_tensor[idx] = float(scores.get('stability', 0.0))
+            except Exception:
+                continue
+        struct_component = self.structure_prior_weight * structure_tensor
+        stab_component = self.stability_prior_weight * stability_tensor
+        total = struct_component + stab_component
+        return total, struct_component, stab_component
+
+    def _reset_action_history(self, env_ids: Optional[torch.Tensor] = None) -> None:
+        if self._last_safe_actions is None:
+            return
+        if env_ids is None:
+            self._last_safe_actions.zero_()
+        else:
+            self._last_safe_actions[env_ids.long().to(self.device)] = 0.0
+
+    def _partition_programs_by_constraints(self, programs: List[List[Dict[str, Any]]]) -> Tuple[List[List[Dict[str, Any]]], List[int], Dict[int, str]]:
+        valid_programs: List[List[Dict[str, Any]]] = []
+        valid_indices: List[int] = []
+        invalid_info: Dict[int, str] = {}
+        for idx, program in enumerate(programs):
+            if isinstance(program, ProgramParamCandidate):
+                valid_programs.append(program)
+                valid_indices.append(idx)
+                continue
+            ok, reason = validate_program(program)
+            if ok:
+                valid_programs.append(program)
+                valid_indices.append(idx)
+            else:
+                invalid_info[idx] = reason or "violates hard constraints"
+        return valid_programs, valid_indices, invalid_info
+
+    def _log_invalid_programs(self, invalid_info: Dict[int, str]) -> None:
+        if not invalid_info:
+            return
+        for idx, reason in invalid_info.items():
+            print(f"[HardConstraint] Skip program #{idx}: {reason}")
+
+    def _merge_rewards_with_invalid(self,
+                                    valid_indices: List[int],
+                                    valid_rewards: List[float],
+                                    invalid_info: Dict[int, str],
+                                    total_count: int) -> List[float]:
+        merged = [float(HARD_CONSTRAINT_PENALTY)] * total_count
+        reward_iter = iter(valid_rewards)
+        for idx in valid_indices:
+            merged[idx] = float(next(reward_iter))
+        self._log_invalid_programs(invalid_info)
+        return merged
+
+    def _metric_template(self) -> Dict[str, float]:
+        return {
+            'position_rmse': 0.0,
+            'settling_time': 0.0,
+            'control_effort': 0.0,
+            'smoothness_jerk': 0.0,
+            'gain_stability': 0.0,
+            'saturation': 0.0,
+            'peak_error': 0.0,
+            'high_freq': 0.0,
+            'finalize_bonus': 0.0,
+            'zero_action_penalty': 0.0,
+            'structure_prior': 0.0,
+            'stability_prior': 0.0,
+            'hard_constraint_violation': 0.0,
+        }
+
+    def _merge_metrics_with_invalid(self,
+                                    valid_indices: List[int],
+                                    rewards_train: List[float],
+                                    rewards_true: List[float],
+                                    metrics: List[Dict[str, float]],
+                                    invalid_info: Dict[int, str],
+                                    total_count: int) -> Tuple[List[float], List[float], List[Dict[str, float]]]:
+        final_train = [float(HARD_CONSTRAINT_PENALTY)] * total_count
+        final_true = [float(HARD_CONSTRAINT_PENALTY)] * total_count
+        final_metrics = [self._metric_template() for _ in range(total_count)]
+        train_iter = iter(rewards_train)
+        true_iter = iter(rewards_true)
+        metric_iter = iter(metrics)
+        for idx in valid_indices:
+            final_train[idx] = float(next(train_iter))
+            final_true[idx] = float(next(true_iter))
+            merged_metric = self._metric_template()
+            merged_metric.update(next(metric_iter))
+            merged_metric['hard_constraint_violation'] = 0.0
+            final_metrics[idx] = merged_metric
+        for idx in invalid_info:
+            final_metrics[idx]['hard_constraint_violation'] = 1.0
+        self._log_invalid_programs(invalid_info)
+        return final_train, final_true, final_metrics
+
+    def _apply_output_mad(self,
+                          actions: torch.Tensor,
+                          use_u_flags: List[bool],
+                          batch_size: int) -> torch.Tensor:
+        if actions is None or actions.shape[0] == 0:
+            return actions
+        # 全局动作缩放（诊断用途）
+        if abs(self.action_scale_multiplier - 1.0) > 1e-6:
+            actions[:batch_size, 2:6] *= self.action_scale_multiplier
+
+        if not self.enable_output_mad:
+            return actions
+
+        if not use_u_flags:
+            return actions
+
+        mask = torch.tensor(use_u_flags, device=self.device, dtype=torch.bool)
+        if not mask.any():
+            return actions
+
+        idx = mask.nonzero(as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            return actions
+
+        action_slice = actions[:batch_size, 2:6]
+        current = action_slice[idx].clone()
+        prev = self._last_safe_actions[idx]
+
+        # Magnitude clamp（力/力矩幅值）
+        current[:, 0] = current[:, 0].clamp(self.mad_min_fz, self.mad_max_fz)
+        lateral = current[:, 1:3]
+        lat_norm = torch.linalg.norm(lateral, dim=1, keepdim=True)
+        lat_scale = torch.clamp(self.mad_max_xy / (lat_norm + self._mad_eps), max=1.0)
+        current[:, 1:3] = lateral * lat_scale
+        current[:, 3] = current[:, 3].clamp(-self.mad_max_yaw, self.mad_max_yaw)
+
+        # Delta clamp（相邻步变化率）
+        delta = current - prev
+        delta[:, 0] = delta[:, 0].clamp(-self.mad_max_delta_fz, self.mad_max_delta_fz)
+        delta[:, 1] = delta[:, 1].clamp(-self.mad_max_delta_xy, self.mad_max_delta_xy)
+        delta[:, 2] = delta[:, 2].clamp(-self.mad_max_delta_xy, self.mad_max_delta_xy)
+        delta[:, 3] = delta[:, 3].clamp(-self.mad_max_delta_yaw, self.mad_max_delta_yaw)
+        safe = prev + delta
+
+        action_slice[idx] = safe
+        self._last_safe_actions.index_copy_(0, idx, safe)
+        return actions
+
     def _compile_program_fast(self, program: List[Dict[str, Any]]) -> Tuple[float, float, float, float]:
         """
         🚀 快速路径: 预编译常量程序 (u_fz/u_tx/u_ty/u_tz = const)
@@ -418,6 +1060,14 @@ class BatchEvaluator:
     
     def _eval_program_forces(self, program: List[Dict[str, Any]], state: Dict[str, float]) -> Tuple[float, float, float, float]:
         """在给定数值 state 下，求解程序产生的 (fz, tx, ty, tz)。
+
+        当前版本将 DSL 输出视为 *残差控制* u_residual，最终控制律为
+
+            u_total = u_base(state) + u_residual(program, state)
+
+        其中 u_base 由底层 Isaac 控制器/segmented PID 提供，本函数仅负责计算
+        u_residual 部分（并做适度裁剪），理论分析上可以将其视为有界扰动项。
+
         策略：聚合所有满足条件的规则，将 set 的值累加（可适度裁剪）。
         注意：仅当程序为“无条件常量 set u_*”形式时，才启用字典制式的快速路径缓存；
         对于 AST 形式（rule={'condition':..., 'action':[BinaryOpNode('set',...)]}），必须走 AST 求值，否则会被错误地当作零动作缓存。
@@ -438,16 +1088,29 @@ class BatchEvaluator:
                 pass
         
         # 慢速路径: 完整AST求值（AST-first 程序或包含条件/非常量表达式）
+        # 使用节点的 evaluate() 方法来支持时间算子（ema, rate, delay 等）
         fz = tx = ty = tz = 0.0
         try:
             for rule in program or []:
-                cond = float(self._ast_eval(rule.get('condition'), state))
+                # 求值条件（使用 evaluate 而不是 _ast_eval）
+                cond_node = rule.get('condition')
+                if cond_node is not None and hasattr(cond_node, 'evaluate'):
+                    cond = float(cond_node.evaluate(state))
+                else:
+                    cond = 1.0  # 无条件默认为真
+                    
                 if cond > 0.0:
                     for a in rule.get('action', []) or []:
                         try:
                             if hasattr(a, 'op') and a.op == 'set' and hasattr(a, 'left') and hasattr(a.left, 'value'):
                                 key = str(getattr(a.left, 'value', ''))
-                                val = float(self._ast_eval(getattr(a, 'right', 0.0), state))
+                                right_node = getattr(a, 'right', None)
+                                # 使用 evaluate() 方法来支持时间算子
+                                if right_node is not None and hasattr(right_node, 'evaluate'):
+                                    val = float(right_node.evaluate(state))
+                                else:
+                                    val = 0.0
+                                    
                                 if key == 'u_fz':
                                     fz += val
                                 elif key == 'u_tx':
@@ -468,6 +1131,167 @@ class BatchEvaluator:
         # 应用全局动作缩放系数（诊断专用）
         scale = float(self.action_scale_multiplier)
         return fz * scale, tx * scale, ty * scale, tz * scale
+
+    def _ensure_tensor(self, value: Any) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value.to(self.device)
+        if hasattr(value, 'to'):  # numpy array
+            return torch.as_tensor(value, device=self.device)
+        return torch.tensor(value, device=self.device)
+
+    def _prepare_gpu_state_tensors(
+        self,
+        pos: torch.Tensor,
+        vel: torch.Tensor,
+        omega: torch.Tensor,
+        quat: torch.Tensor,
+        tgt: torch.Tensor,
+        integral_states: List[Dict[str, float]],
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        batch_size = pos.shape[0]
+        tgt_view = tgt.view(1, 3)
+        pos_err = tgt_view - pos
+        pos_err_xy = torch.linalg.norm(pos_err[:, :2], dim=1)
+        pos_err_mag = torch.linalg.norm(pos_err, dim=1)
+        vel_err = torch.linalg.norm(vel, dim=1)
+        ang_vel_mag = torch.linalg.norm(omega, dim=1)
+        if self._gpu_executor is not None:
+            rpy = self._gpu_executor.quat_to_rpy_gpu(quat)
+        else:
+            rpy = torch.zeros_like(pos)
+        rpy_err_mag = torch.linalg.norm(rpy, dim=1)
+
+        integral_tensor = torch.zeros((batch_size, 6), device=self.device)
+        for idx in range(batch_size):
+            buf = integral_states[idx]
+            integral_tensor[idx, 0] = float(buf.get('err_i_x', 0.0))
+            integral_tensor[idx, 1] = float(buf.get('err_i_y', 0.0))
+            integral_tensor[idx, 2] = float(buf.get('err_i_z', 0.0))
+            integral_tensor[idx, 3] = float(buf.get('err_i_roll', 0.0))
+            integral_tensor[idx, 4] = float(buf.get('err_i_pitch', 0.0))
+            integral_tensor[idx, 5] = float(buf.get('err_i_yaw', 0.0))
+
+        state_tensors = {
+            'pos_err_x': pos_err[:, 0],
+            'pos_err_y': pos_err[:, 1],
+            'pos_err_z': pos_err[:, 2],
+            'pos_err': pos_err_mag,
+            'pos_err_xy': pos_err_xy,
+            'pos_err_z_abs': torch.abs(pos_err[:, 2]),
+            'vel_x': vel[:, 0],
+            'vel_y': vel[:, 1],
+            'vel_z': vel[:, 2],
+            'vel_err': vel_err,
+            'err_p_roll': rpy[:, 0],
+            'err_p_pitch': rpy[:, 1],
+            'err_p_yaw': rpy[:, 2],
+            'ang_err': rpy_err_mag,
+            'rpy_err_mag': rpy_err_mag,
+            'ang_vel_x': omega[:, 0],
+            'ang_vel_y': omega[:, 1],
+            'ang_vel_z': omega[:, 2],
+            'ang_vel': ang_vel_mag,
+            'ang_vel_mag': ang_vel_mag,
+            'err_i_x': integral_tensor[:, 0],
+            'err_i_y': integral_tensor[:, 1],
+            'err_i_z': integral_tensor[:, 2],
+            'err_i_roll': integral_tensor[:, 3],
+            'err_i_pitch': integral_tensor[:, 4],
+            'err_i_yaw': integral_tensor[:, 5],
+            'err_d_x': -vel[:, 0],
+            'err_d_y': -vel[:, 1],
+            'err_d_z': -vel[:, 2],
+            'err_d_roll': -omega[:, 0],
+            'err_d_pitch': -omega[:, 1],
+            'err_d_yaw': -omega[:, 2],
+        }
+        return state_tensors, pos_err, rpy
+
+    def _update_integral_states(
+        self,
+        integral_states: List[Dict[str, float]],
+        pos_err: torch.Tensor,
+        rpy: torch.Tensor,
+        done_mask: torch.Tensor,
+        dt: float,
+    ) -> None:
+        pos_err_det = pos_err.detach()
+        rpy_det = rpy.detach()
+        done = done_mask.detach().bool()
+        for idx, buf in enumerate(integral_states):
+            if done[idx]:
+                continue
+            buf['err_i_x'] = float(buf.get('err_i_x', 0.0) + pos_err_det[idx, 0].item() * dt)
+            buf['err_i_y'] = float(buf.get('err_i_y', 0.0) + pos_err_det[idx, 1].item() * dt)
+            buf['err_i_z'] = float(buf.get('err_i_z', 0.0) + pos_err_det[idx, 2].item() * dt)
+            buf['err_i_roll'] = float(buf.get('err_i_roll', 0.0) + rpy_det[idx, 0].item() * dt)
+            buf['err_i_pitch'] = float(buf.get('err_i_pitch', 0.0) + rpy_det[idx, 1].item() * dt)
+            buf['err_i_yaw'] = float(buf.get('err_i_yaw', 0.0) + rpy_det[idx, 2].item() * dt)
+
+    def _apply_pid_controllers(
+        self,
+        controllers: List[Any],
+        use_u_flags: List[bool],
+        actions: torch.Tensor,
+        step: int,
+        pos,
+        quat,
+        vel,
+        omega,
+        tgt_np,
+        integral_states: List[Dict[str, float]],
+        ever_nonzero: torch.Tensor,
+        debug_enabled: bool,
+    ) -> None:
+        if not controllers:
+            return
+        dt = float(getattr(self, '_control_dt', 1.0 / 48.0))
+        import numpy as _np
+
+        for i, ctrl in enumerate(controllers):
+            if use_u_flags[i] or ctrl is None:
+                continue
+            try:
+                pos_i = pos[i]
+                quat_i = quat[i]
+                vel_i = vel[i]
+                omega_i = omega[i]
+                if isinstance(pos_i, torch.Tensor):
+                    pos_i = pos_i.detach().cpu().numpy()
+                if isinstance(quat_i, torch.Tensor):
+                    quat_i = quat_i.detach().cpu().numpy()
+                if isinstance(vel_i, torch.Tensor):
+                    vel_i = vel_i.detach().cpu().numpy()
+                if isinstance(omega_i, torch.Tensor):
+                    omega_i = omega_i.detach().cpu().numpy()
+                ctrl_actions = ctrl.step(
+                    time_step=step,
+                    pos_x=float(pos_i[0]),
+                    pos_y=float(pos_i[1]),
+                    pos_z=float(pos_i[2]),
+                    target_x=float(tgt_np[0]),
+                    target_y=float(tgt_np[1]),
+                    target_z=float(tgt_np[2]),
+                )
+                actions[i, 0] = float(ctrl_actions.get('fx', 0.0))
+                actions[i, 1] = float(ctrl_actions.get('fy', 0.0))
+                actions[i, 2] = float(ctrl_actions.get('fz', 0.0))
+                actions[i, 3] = float(ctrl_actions.get('tx', 0.0))
+                actions[i, 4] = float(ctrl_actions.get('ty', 0.0))
+                actions[i, 5] = float(ctrl_actions.get('tz', 0.0))
+                if self.strict_no_prior:
+                    nz = (abs(actions[i, 2]) > 1e-6) or (abs(actions[i, 3]) > 1e-8) or \
+                         (abs(actions[i, 4]) > 1e-8) or (abs(actions[i, 5]) > 1e-8)
+                    if nz:
+                        ever_nonzero[i] = True
+                pe = _np.asarray(tgt_np, dtype=_np.float32) - _np.asarray(pos_i, dtype=_np.float32)
+                integral_states[i]['err_i_x'] += float(pe[0]) * dt
+                integral_states[i]['err_i_y'] += float(pe[1]) * dt
+                integral_states[i]['err_i_z'] += float(pe[2]) * dt
+            except Exception as exc:
+                if debug_enabled:
+                    print(f"[DebugReward] Controller step failed for env {i}: {exc}")
+                continue
 
     # ---------------------- 资源清理 ----------------------
     def close(self):
@@ -532,23 +1356,73 @@ class BatchEvaluator:
         Returns:
             rewards: 每个程序的奖励（负值=误差，越大越好）
         """
-        # 初始化环境池
+        total_requested = len(programs)
+
+        # 先按硬约束过滤
+        valid_programs, valid_indices, invalid_info = self._partition_programs_by_constraints(programs)
+        if not valid_programs:
+            self._log_invalid_programs(invalid_info)
+            return [float(HARD_CONSTRAINT_PENALTY)] * total_requested
+        programs = valid_programs
+
+        # 初始化环境池（在BO之前，避免BO第1轮触发初始化开销）
         if self._isaac_env_pool is None:
             self._init_isaac_gym_pool()
+
+        # 🔥 贝叶斯优化调参（🚀 批量并行优化：所有程序的BO候选参数一起评估）
+        if self.enable_bayesian_tuning:
+            programs = self._batch_tune_programs_with_bo(programs)
 
         # 延迟导入 torch：确保在 isaacgym 成功导入之后
         import torch  # type: ignore
 
-        num_programs_original = len(programs)
+        # 评估缓存：为每个有效程序生成键，拆分缓存命中与待评估子集
+        cache_keys: List[Optional[str]] = []
+        cached_rewards: Dict[int, float] = {}
+        indices_to_eval: List[int] = []
+        for idx, prog in enumerate(programs):
+            try:
+                key = self._program_eval_key(prog)
+            except Exception:
+                key = None
+            cache_keys.append(key)
+            if key is not None and key in self._eval_cache:
+                cached_rewards[idx] = float(self._eval_cache[key])
+            else:
+                indices_to_eval.append(idx)
+
+        # 👀 轻量级缓存命中率日志（主要用于观察 BO 内部复用情况）
+        num_valid = len(programs)
+        num_cached = len(cached_rewards)
+        num_new = len(indices_to_eval)
+        if num_valid > 0 and (num_cached > 0 or num_new > 0):
+            hit_rate = num_cached / float(num_valid)
+            print(f"[EvalCache] valid={num_valid}, cached={num_cached}, new={num_new}, hit={hit_rate:.3f}")
+
+        if len(indices_to_eval) == 0:
+            # 全部命中缓存，直接合并无效程序并返回
+            cached_list = [cached_rewards[i] for i in range(len(programs))]
+            return self._merge_rewards_with_invalid(valid_indices, cached_list, invalid_info, total_requested)
+
+        # 构造待真实评估的子列表
+        programs_to_eval = [programs[i] for i in indices_to_eval]
+
+        # 对仍需真实仿真的候选，延迟构造实际 DSL 程序
+        programs_to_eval = [
+            prog.materialize() if isinstance(prog, ProgramParamCandidate) else prog
+            for prog in programs_to_eval
+        ]
+
+        num_programs_original = len(programs_to_eval)
         
         # 🔧 扩展replicas: 每个程序复制 replicas_per_program 次
         if self.replicas_per_program > 1:
             programs_expanded = []
-            for prog in programs:
+            for prog in programs_to_eval:
                 programs_expanded.extend([prog] * self.replicas_per_program)
-            programs = programs_expanded
-        
-        num_programs = len(programs)
+            programs_to_eval = programs_expanded
+
+        num_programs = len(programs_to_eval)
         rewards = []
         
         start_time = time.time()
@@ -558,25 +1432,26 @@ class BatchEvaluator:
         
         for batch_start in range(0, num_programs, programs_per_batch):
             batch_end = min(batch_start + programs_per_batch, num_programs)
-            batch_programs = programs[batch_start:batch_end]
+            batch_programs = programs_to_eval[batch_start:batch_end]
             batch_size = len(batch_programs)
+
             
-            # 🚀 环境池持久化优化: 只在必要时reset
-            # 条件: 1) 首次使用 或 2) 需要更多环境数
-            num_needed = batch_size
-            should_reset = (not self._envs_ready) or (num_needed > self._last_reset_size)
+            # ✅ 确定性评估：强制每批评估前完全重置环境（确保相同程序得到相同奖励）
+            # 原因：环境池复用会导致新程序从上一个程序的结束状态开始，引入不可控的随机性
+            # 修复：永远执行 reset()，保证每个程序都从固定初始状态 (0,0,h) 开始评估
             
-            if should_reset:
+            # 轻量级确定性重置：保留环境池，只重置状态
+            if not self._envs_ready:
+                # 首次：完整初始化环境池
                 obs = self._isaac_env_pool.reset()
                 self._envs_ready = True
                 self._last_reset_size = self.isaac_num_envs
-                if os.getenv('DEBUG_ENV_POOL', '0') == '1':
-                    print(f"[BatchEvaluator] 🔄 Reset环境池 (需要{num_needed}个环境)")
+                self._reset_action_history()
             else:
-                # 复用环境状态,直接获取观测 (避免7秒GPU同步开销!)
-                obs = self._isaac_env_pool.get_obs()
-                if os.getenv('DEBUG_ENV_POOL', '0') == '1':
-                    print(f"[BatchEvaluator] ♻️ 复用环境池 (需要{num_needed}个,已有{self._last_reset_size}个) ⚡")
+                # 后续：只重置前 batch_size 个环境到初始状态 (快速，无重建开销)
+                env_ids_to_reset = torch.arange(batch_size, dtype=torch.long, device=self.device)
+                obs = self._isaac_env_pool.reset(env_ids=env_ids_to_reset)
+                self._reset_action_history(env_ids_to_reset)
             
             # 运行仿真（环境池大小可能大于本批大小，按前 batch_size 个槽位使用）
             total_rewards = torch.zeros(self.isaac_num_envs, device=self.device)
@@ -609,6 +1484,7 @@ class BatchEvaluator:
             # 准备每个程序对应的控制器/模式
             controllers = []
             use_u_flags = []  # True 表示该程序直接输出 (fz,tx,ty,tz)
+            gpu_batch_token = None
             try:
                 from .segmented_controller import PiLightSegmentedPIDController
             except ImportError:
@@ -659,6 +1535,14 @@ class BatchEvaluator:
                     for prog in batch_programs:
                         use_u_flags.append(self._program_uses_u(prog))
 
+                if (self._gpu_executor is not None and self.use_gpu_expression_executor and any(use_u_flags)):
+                    try:
+                        gpu_batch_token = self._gpu_executor.prepare_batch(batch_programs)
+                    except Exception as gpu_batch_exc:
+                        gpu_batch_token = None
+                        if debug_enabled:
+                            print(f"[GPUExecutor] ⚠️ 批次绑定失败，使用CPU路径: {gpu_batch_exc}")
+
             # 控制步数（以控制频率计，不再按物理频率）
             max_steps = int(self.duration * float(getattr(self, '_control_freq', 48)))
             min_steps = int(max_steps * self.min_steps_frac)
@@ -666,6 +1550,16 @@ class BatchEvaluator:
             # 调试辅助：记录首末位置误差（仅在开启 DEBUG_STEPWISE 时）
             first_pos_err = None
             last_pos_err = None
+            
+            # 统计整个 Episode 的动作幅度
+            episode_stats = {
+                'sum_fz': 0.0, 'max_fz': 0.0,
+                'sum_tx': 0.0, 'max_tx': 0.0,
+                'count': 0
+            }
+
+            # 预先分配动作张量，循环内复用以减少反复分配
+            actions = torch.zeros((self.isaac_num_envs, 6), device=self.device)
 
             for step in range(max_steps):
                 # 计算目标点（所有 env 相同目标轨迹，使用动态轨迹而不是静态 cfg.target）
@@ -674,21 +1568,117 @@ class BatchEvaluator:
                 tgt_tensor = torch.tensor(tgt_np, device=self.device, dtype=torch.float32)
 
                 # 生成动作（统一为 [fx,fy,fz,tx,ty,tz] 6 维格式，便于混用）
-                actions = torch.zeros((self.isaac_num_envs, 6), device=self.device)
+                actions.zero_()
                 pos = obs['position'][:batch_size]
                 quat = obs['orientation'][:batch_size]
                 vel = obs['velocity'][:batch_size]
                 omega = obs['angular_velocity'][:batch_size]
-                
-                # 🚀🚀 超高性能路径: 完全向量化 + JIT
-                if self.use_fast_path and self._ultra_executor is not None and step == 0:
-                    # 首次步骤: 预编译所有程序 (只做一次)
+                gpu_actions_applied = False
+                if gpu_batch_token is not None and (not hasattr(self, '_cuda_executor') or self._cuda_executor is None or not hasattr(self, '_compiled_forces_gpu')):
                     try:
-                        if not hasattr(self, '_compiled_forces'):
-                            # 仅当所有程序皆为“无条件常量 set u_*”时，才启用 UltraFast
+                        pos_tensor = self._ensure_tensor(pos)
+                        vel_tensor = self._ensure_tensor(vel)
+                        omega_tensor = self._ensure_tensor(omega)
+                        quat_tensor = self._ensure_tensor(quat)
+                        state_tensors, pos_err_tensor, rpy_tensor = self._prepare_gpu_state_tensors(
+                            pos_tensor, vel_tensor, omega_tensor, quat_tensor, tgt_tensor, integral_states
+                        )
+                        gpu_use_mask = torch.tensor(use_u_flags, dtype=torch.bool, device=self.device)
+                        gpu_outputs = self._gpu_executor.evaluate(
+                            gpu_batch_token,
+                            state_tensors,
+                            gpu_use_mask,
+                            active_mask=(~done_flags_batch)
+                        )
+                        actions[:batch_size, 2:6] = torch.where(
+                            gpu_use_mask.unsqueeze(-1),
+                            gpu_outputs,
+                            actions[:batch_size, 2:6]
+                        )
+                        if self.strict_no_prior:
+                            nz_mask = (
+                                gpu_outputs[:, 0].abs() > 1e-6
+                            ) | (
+                                gpu_outputs[:, 1].abs() > 1e-8
+                            ) | (
+                                gpu_outputs[:, 2].abs() > 1e-8
+                            ) | (
+                                gpu_outputs[:, 3].abs() > 1e-8
+                            )
+                            ever_nonzero |= (gpu_use_mask & nz_mask)
+                        self._update_integral_states(
+                            integral_states,
+                            pos_err_tensor,
+                            rpy_tensor,
+                            done_flags_batch,
+                            float(getattr(self, '_control_dt', 1.0 / 48.0))
+                        )
+                        if not self.strict_no_prior:
+                            self._apply_pid_controllers(
+                                controllers,
+                                use_u_flags,
+                                actions,
+                                step,
+                                pos_tensor,
+                                quat_tensor,
+                                vel_tensor,
+                                omega_tensor,
+                                tgt_np,
+                                integral_states,
+                                ever_nonzero,
+                                debug_enabled,
+                            )
+                        gpu_actions_applied = True
+                    except Exception as gpu_step_exc:
+                        gpu_actions_applied = False
+                        if debug_enabled:
+                            print(f"[GPUExecutor] ⚠️ step{step} 回退CPU: {gpu_step_exc}")
+                
+                # 🚀🚀🚀 CUDA超高性能路径: 完全GPU执行 (step 0时初始化)
+                if not gpu_actions_applied and self.use_fast_path and step == 0:
+                    try:
+                        # 优先尝试CUDA执行器 (零CPU传输)
+                        if not hasattr(self, '_cuda_executor_initialized'):
+                            self._cuda_executor_initialized = True
+                            try:
+                                from .cuda_program_executor import CUDAProgramExecutor
+                                self._cuda_executor = CUDAProgramExecutor(device=str(self.device))
+                                print(f"[CUDA] 🚀 初始化CUDA执行器 (设备: {self.device})")
+                            except Exception as e:
+                                print(f"[CUDA] ⚠️ CUDA执行器不可用: {e}")
+                                self._cuda_executor = None
+                        
+                        # CUDA编译
+                        if self._cuda_executor is not None and not hasattr(self, '_compiled_forces_gpu'):
                             if self._all_programs_const(batch_programs):
-                                self._compiled_forces = self._ultra_executor.compile_programs(batch_programs)
-                                print(f"[UltraFast] ✅ 预编译{len(batch_programs)}程序 → 缓存{len(self._ultra_executor.program_cache)}个唯一程序")
+                                t0 = time.time()
+                                self._compiled_forces_gpu = self._cuda_executor.compile_constant_programs(batch_programs)
+                                compile_time = (time.time() - t0) * 1000
+                                
+                                if self._compiled_forces_gpu is not None:
+                                    print(f"[CUDA] ✅ GPU预编译{len(batch_programs)}程序 ({compile_time:.2f}ms)")
+                                    print(f"[CUDA] 💾 Forces shape: {self._compiled_forces_gpu.shape}, device: {self._compiled_forces_gpu.device}")
+                                else:
+                                    print(f"[CUDA] ⚠️ 包含非常量程序，回退到CPU路径")
+                                    self._cuda_executor = None
+                            else:
+                                print(f"[CUDA] ⚠️ 存在条件/表达式程序，回退到CPU路径")
+                                self._cuda_executor = None
+                    except Exception as e:
+                        print(f"[CUDA] ❌ 编译失败: {e}, 回退到CPU路径")
+                        self._cuda_executor = None
+                
+                # 🚀🚀 超高性能路径: 完全向量化 + JIT (CPU fallback)
+                if not gpu_actions_applied and self.use_fast_path and self._ultra_executor is not None and step == 0:
+                    # 只有当CUDA不可用时才使用CPU UltraFast
+                    if not hasattr(self, '_cuda_executor') or self._cuda_executor is None:
+                        # 首次步骤: 预编译所有程序 (只做一次)
+                        try:
+                            if not hasattr(self, '_compiled_forces'):
+                                # 仅当所有程序皆为“无条件常量 set u_*”时，才启用 UltraFast
+                                if self._all_programs_const(batch_programs):
+                                    self._compiled_forces = self._ultra_executor.compile_programs(batch_programs)
+                                    print(f"[UltraFast CPU] ✅ 预编译{len(batch_programs)}程序 → 缓存{len(self._ultra_executor.program_cache)}个唯一程序")
                                 # 若全部常量结果几乎为零，且严格无先验，则放弃 UltraFast 以避免长期零动作退化
                                 try:
                                     import numpy as _np
@@ -702,12 +1692,27 @@ class BatchEvaluator:
                             else:
                                 # 存在条件/非常量表达式：禁用 UltraFast，回退到逐步AST评估，确保动作依赖状态
                                 self._ultra_executor = None
-                    except Exception as e:
-                        print(f"[UltraFast] ⚠️ 预编译失败: {e}, 回退到标准快速路径")
-                        self._ultra_executor = None
+                        except Exception as e:
+                            print(f"[UltraFast] ⚠️ 预编译失败: {e}, 回退到标准快速路径")
+                            self._ultra_executor = None
                 
-                # 🚀 快速路径: 批量处理 u_* 路径
-                if self.use_fast_path:
+                # 🚀🚀🚀 完全GPU路径: 零CPU传输 (CUDA加速)
+                if not gpu_actions_applied and self.use_fast_path and hasattr(self, '_cuda_executor') and self._cuda_executor is not None:
+                    try:
+                        # 100% GPU执行: 无CPU↔GPU传输!
+                        if hasattr(self, '_compiled_forces_gpu'):
+                            # ✅ CUDA执行器已经返回正确大小的tensor [batch_size, 6]
+                            actions[:batch_size] = self._cuda_executor.apply_constant_forces_vectorized(
+                                self._compiled_forces_gpu,
+                                batch_size,
+                                self.isaac_num_envs
+                            )
+                    except Exception as e:
+                        print(f"[CUDA Fast Path] ⚠️ GPU执行失败: {e}, 回退到CPU路径")
+                        self._cuda_executor = None
+                
+                # 🚀 快速路径: 批量处理 u_* 路径 (CPU fallback)
+                if not gpu_actions_applied and self.use_fast_path and (not hasattr(self, '_cuda_executor') or self._cuda_executor is None):
                     # 预先导入scipy（避免循环内重复导入）
                     try:
                         from scipy.spatial.transform import Rotation
@@ -929,7 +1934,7 @@ class BatchEvaluator:
                                 if debug_enabled:
                                     print(f"[DebugReward] Controller step failed for env {i}: {e}")
                                 pass
-                else:
+                elif not gpu_actions_applied:
                     # 慢速路径: 原始串行处理
                     for i in range(batch_size):
                         ctrl = controllers[i]
@@ -1027,14 +2032,29 @@ class BatchEvaluator:
                             # 失败则保持零动作
                             pass
                 
-                # 步进仿真
+                # 输出安全壳 (MAD) + 步进仿真
+                actions = self._apply_output_mad(actions, use_u_flags, batch_size)
+                
+                # 更新统计
+                if debug_enabled or batch_start == 0:
+                    try:
+                        fz_vals = actions[:batch_size, 2].abs()
+                        tx_vals = actions[:batch_size, 3].abs()
+                        episode_stats['sum_fz'] += float(fz_vals.sum().item())
+                        episode_stats['max_fz'] = max(episode_stats['max_fz'], float(fz_vals.max().item()))
+                        episode_stats['sum_tx'] += float(tx_vals.sum().item())
+                        episode_stats['max_tx'] = max(episode_stats['max_tx'], float(tx_vals.max().item()))
+                        episode_stats['count'] += batch_size
+                    except Exception:
+                        pass
+
                 obs, step_rewards_env, dones, infos = self._isaac_env_pool.step(actions)
 
-                # 自定义奖励：轨迹跟踪 + 速度惩罚 + 控制能量惩罚 + 坠毁惩罚
-                import torch
-                pos = torch.tensor(obs['position'], device=self.device, dtype=torch.float32)
-                vel = torch.tensor(obs['velocity'], device=self.device, dtype=torch.float32)
-                omega = torch.tensor(obs['angular_velocity'], device=self.device, dtype=torch.float32)
+                # 直接从 Isaac Gym 获取 GPU 张量快照，避免 CPU↔GPU 往返
+                tensor_obs = self._isaac_env_pool.get_states_batch()
+                pos_gpu = tensor_obs['pos']
+                vel_gpu = tensor_obs['vel']
+                omega_gpu = tensor_obs['omega']
                 # 目标（悬停或轨迹）
                 if self.trajectory_config.get('type') == 'hover':
                     tgt = np.array([0.0, 0.0, self.trajectory_config.get('height', 1.0)], dtype=np.float32)
@@ -1043,33 +2063,32 @@ class BatchEvaluator:
                 # Stepwise 奖励
                 if self._step_reward_calc is not None:
                     step_total = self._step_reward_calc.compute_step(
-                        pos[:batch_size, :],
+                        pos_gpu[:batch_size, :],
                         tgt_tensor,
-                        vel[:batch_size, :],
-                        omega[:batch_size, :],
+                        vel_gpu[:batch_size, :],
+                        omega_gpu[:batch_size, :],
                         actions[:batch_size, :],
                         done_flags_batch
                     )
                     step_reward = step_total
                 else:
                     # 退回旧逻辑
-                    # 悬停模式：加大位置权重，降低速度容忍度
                     if self.trajectory_config.get('type') == 'hover':
                         w_pos, w_vel = 2.0, 0.3  # 悬停：更看重精确定点和静止
                     else:
                         w_pos, w_vel = 1.0, 0.1  # 轨迹跟踪：允许一定速度
-                    pos_err = pos[:batch_size, :] - tgt_tensor
+                    pos_err = pos_gpu[:batch_size, :] - tgt_tensor
                     step_reward = - w_pos * torch.norm(pos_err, dim=1)
-                    step_reward -= w_vel * torch.norm(vel[:batch_size, :], dim=1)
+                    step_reward -= w_vel * torch.norm(vel_gpu[:batch_size, :], dim=1)
                     act_pen = 1e-7 * torch.sum(actions[:batch_size, :] ** 2, dim=1)
                     step_reward -= act_pen
-                    crashed = pos[:batch_size, 2] < 0.1
+                    crashed = pos_gpu[:batch_size, 2] < 0.1
                     step_reward[crashed] -= 5.0
 
                 # 调试：记录首末位置误差（使用动态目标）
                 if debug_enabled:
                     # 计算当前步的绝对位置误差模长
-                    cur_pos_err = torch.norm(pos[:batch_size, :] - tgt_tensor.view(1, 3), dim=1)
+                    cur_pos_err = torch.norm(pos_gpu[:batch_size, :] - tgt_tensor.view(1, 3), dim=1)
                     if step == 0:
                         first_pos_err = cur_pos_err.detach()[:min(8, batch_size)].cpu()
                     last_pos_err = cur_pos_err.detach()[:min(8, batch_size)].cpu()
@@ -1096,22 +2115,22 @@ class BatchEvaluator:
                         print(f"[DebugReward] zero-action programs in batch: {zero_cnt}/{batch_size}")
                     except Exception:
                         pass
+
+            if gpu_batch_token is not None:
+                self._gpu_executor.release_batch(gpu_batch_token)
             
             # 🔍 动作幅度统计（诊断用）：计算本批动作输出的平均幅度与最大值
-            if debug_enabled or batch_start == 0:
-                try:
-                    # 抓取本轮step中所有环境的fz/tx/ty/tz
-                    fz_vals = actions[:batch_size, 2].abs()
-                    tx_vals = actions[:batch_size, 3].abs()
-                    ty_vals = actions[:batch_size, 4].abs()
-                    tz_vals = actions[:batch_size, 5].abs()
-                    avg_fz = float(fz_vals.mean().item())
-                    max_fz = float(fz_vals.max().item())
-                    avg_tx = float(tx_vals.mean().item())
-                    max_tx = float(tx_vals.max().item())
-                    print(f"[ActionAmp] Batch{batch_start//programs_per_batch}: avg_fz={avg_fz:.4f}, max_fz={max_fz:.4f}, avg_tx={avg_tx:.6f}, max_tx={max_tx:.6f}")
-                except Exception:
-                    pass
+            # 注释掉以减少日志输出噪音
+            # if debug_enabled or batch_start == 0:
+            #     try:
+            #         count = max(1, episode_stats['count'])
+            #         avg_fz = episode_stats['sum_fz'] / count
+            #         max_fz = episode_stats['max_fz']
+            #         avg_tx = episode_stats['sum_tx'] / count
+            #         max_tx = episode_stats['max_tx']
+            #         print(f"[ActionAmp] Batch{batch_start//programs_per_batch}: avg_fz={avg_fz:.4f}, max_fz={max_fz:.4f}, avg_tx={avg_tx:.6f}, max_tx={max_tx:.6f}")
+            #     except Exception:
+            #         pass
             
             # 复杂度激励：奖励使用多变量和多规则的程序
             if self.complexity_bonus > 0:
@@ -1136,6 +2155,10 @@ class BatchEvaluator:
                         print(f"[DebugReward] complexity bonuses: {complexity_rewards[:min(8, batch_size)].cpu().numpy()}")
                     except Exception:
                         pass
+
+            prior_bonus = self._compute_prior_bonus(batch_programs)
+            if prior_bonus is not None:
+                total_rewards[:batch_size] += prior_bonus[0]
             
             # 归约
             if self.reward_reduction == 'mean':
@@ -1161,29 +2184,72 @@ class BatchEvaluator:
         elapsed = time.time() - start_time
         # 显示原始程序数(未扩展replicas前)
         display_count = num_programs_original if self.replicas_per_program > 1 else num_programs
-        print(f"[BatchEvaluator] ✅ 评估完成: {display_count} 程序 (×{self.replicas_per_program} replicas), {elapsed:.2f}秒 ({elapsed/display_count*1000:.1f}ms/程序)")
+        # 注释掉详细评估日志，减少输出噪音
+        # print(f"[BatchEvaluator] ✅ 评估完成: {display_count} 程序 (×{self.replicas_per_program} replicas), {elapsed:.2f}秒 ({elapsed/display_count*1000:.1f}ms/程序)")
         
-        # 🔧 如果使用了replicas, 对每个原始程序的replicas求平均
+        # 先将新评估结果写入缓存（以“单程序”粒度，而非 replicas）
+        # rewards 当前长度为 num_programs_original×replicas_per_program（或无replicas时为 num_programs_original）
+        # 先得到每个原始程序的平均奖励，用于缓存和后续合并
+        per_program_rewards: List[float]
         if self.replicas_per_program > 1:
-            averaged_rewards = []
+            per_program_rewards = []
             for i in range(num_programs_original):
                 start_idx = i * self.replicas_per_program
                 end_idx = start_idx + self.replicas_per_program
                 avg_reward = float(np.mean(rewards[start_idx:end_idx]))
-                averaged_rewards.append(avg_reward)
-            return averaged_rewards
-        
-        return rewards
+                per_program_rewards.append(avg_reward)
+        else:
+            per_program_rewards = [float(r) for r in rewards]
 
-    def evaluate_batch_with_metrics(self, programs: List[List[Dict[str, Any]]]) -> Tuple[List[float], List[Dict[str, float]]]:
+        # 写入 eval cache
+        for local_idx, prog_reward in zip(indices_to_eval, per_program_rewards):
+            key = cache_keys[local_idx]
+            if key is None:
+                continue
+            self._eval_cache[key] = float(prog_reward)
+        if len(self._eval_cache) > self._eval_cache_limit:
+            remove_n = max(1, int(self._eval_cache_limit * 0.2))
+            for _ in range(remove_n):
+                try:
+                    self._eval_cache.pop(next(iter(self._eval_cache)))
+                except Exception:
+                    break
+
+        # 将缓存命中与新评估结果组合成“仅有效程序”的完整列表
+        merged_valid_rewards: List[float] = []
+        eval_iter = iter(per_program_rewards)
+        for idx in range(len(programs)):
+            if idx in cached_rewards:
+                merged_valid_rewards.append(cached_rewards[idx])
+            else:
+                merged_valid_rewards.append(float(next(eval_iter)))
+
+        if len(valid_indices) == total_requested:
+            return merged_valid_rewards
+        return self._merge_rewards_with_invalid(valid_indices, merged_valid_rewards, invalid_info, total_requested)
+
+    def evaluate_batch_with_metrics(self, programs: List[List[Dict[str, Any]]]) -> Tuple[List[float], List[float], List[Dict[str, float]]]:
         """与 evaluate_batch 类似，但额外返回逐分量奖励汇总（加权后）用于分析/记录。
 
         Returns:
-            rewards: 每个程序的总奖励（对 replicas 取平均后）
+            rewards_train: 每个程序的训练奖励（含零动作惩罚，对 replicas 取平均后）
+            rewards_true: 每个程序的真实奖励（不含惩罚，对 replicas 取平均后）
             metrics: 每个程序的组件字典（同样对 replicas 平均），键包含：
                      ['position_rmse','settling_time','control_effort','smoothness_jerk',
-                      'gain_stability','saturation','peak_error','high_freq','finalize_bonus']
+                      'gain_stability','saturation','peak_error','high_freq','finalize_bonus',
+                      'zero_action_penalty','structure_prior','stability_prior']
         """
+        total_requested = len(programs)
+        valid_programs, valid_indices, invalid_info = self._partition_programs_by_constraints(programs)
+        if not valid_programs:
+            self._log_invalid_programs(invalid_info)
+            penalty = [float(HARD_CONSTRAINT_PENALTY)] * total_requested
+            metrics = [self._metric_template() for _ in range(total_requested)]
+            for idx in invalid_info:
+                metrics[idx]['hard_constraint_violation'] = 1.0
+            return penalty, penalty[:], metrics
+        programs = valid_programs
+
         # 初始化环境池
         if self._isaac_env_pool is None:
             self._init_isaac_gym_pool()
@@ -1199,7 +2265,8 @@ class BatchEvaluator:
             programs = programs_expanded
 
         num_programs = len(programs)
-        rewards: List[float] = []
+        rewards: List[float] = []  # 训练奖励（含惩罚）
+        rewards_true: List[float] = []  # 真实奖励（不含惩罚）
         metrics_all: List[Dict[str, float]] = []  # 与 rewards 顺序一一对应（扩展后）
 
         start_time = time.time()
@@ -1210,14 +2277,18 @@ class BatchEvaluator:
             batch_programs = programs[batch_start:batch_end]
             batch_size = len(batch_programs)
 
+            # 轻量级确定性重置：保留环境池，只重置状态 (fast_path版本)
             num_needed = batch_size
-            should_reset = (not self._envs_ready) or (num_needed > self._last_reset_size)
-            if should_reset:
+            
+            if not self._envs_ready:
                 obs = self._isaac_env_pool.reset()
                 self._envs_ready = True
                 self._last_reset_size = self.isaac_num_envs
+                self._reset_action_history()
             else:
-                obs = self._isaac_env_pool.get_obs()
+                env_ids_to_reset = torch.arange(batch_size, dtype=torch.long, device=self.device)
+                obs = self._isaac_env_pool.reset(env_ids=env_ids_to_reset)
+                self._reset_action_history(env_ids_to_reset)
 
             total_rewards = torch.zeros(self.isaac_num_envs, device=self.device)
             done_flags = torch.zeros(self.isaac_num_envs, dtype=torch.bool, device=self.device)
@@ -1239,6 +2310,7 @@ class BatchEvaluator:
                 }
                 for _ in range(batch_size)
             ]
+            debug_enabled = bool(int(os.getenv('DEBUG_STEPWISE', '0')))
 
             try:
                 from .segmented_controller import PiLightSegmentedPIDController
@@ -1247,37 +2319,46 @@ class BatchEvaluator:
                     from utils.segmented_controller import PiLightSegmentedPIDController
                 except ImportError:
                     PiLightSegmentedPIDController = None  # type: ignore
+            gpu_batch_token = None
             if self.strict_no_prior:
                 controllers = [None for _ in range(batch_size)]
                 use_u_flags = [True for _ in range(batch_size)]
             else:
                 controllers = []
                 use_u_flags = []
-            # UltraFast 仅在所有程序为常量 set 情况下启用（metrics 评估同理）
-            if self.use_fast_path and self._ultra_executor is not None:
-                try:
-                    if not self._all_programs_const(batch_programs):
+                # UltraFast 仅在所有程序为常量 set 情况下启用（metrics 评估同理）
+                if self.use_fast_path and self._ultra_executor is not None:
+                    try:
+                        if not self._all_programs_const(batch_programs):
+                            self._ultra_executor = None
+                    except Exception:
                         self._ultra_executor = None
-                except Exception:
-                    self._ultra_executor = None
-                if PiLightSegmentedPIDController is not None:
-                    for prog in batch_programs:
-                        if self._program_uses_u(prog):
-                            controllers.append(None); use_u_flags.append(True)
-                        else:
-                            controllers.append(
-                                PiLightSegmentedPIDController(
-                                    program=prog,
-                                    suppress_init_print=True,
-                                    semantics='compose_by_gain',
-                                    min_hold_steps=2
+                    if PiLightSegmentedPIDController is not None:
+                        for prog in batch_programs:
+                            if self._program_uses_u(prog):
+                                controllers.append(None); use_u_flags.append(True)
+                            else:
+                                controllers.append(
+                                    PiLightSegmentedPIDController(
+                                        program=prog,
+                                        suppress_init_print=True,
+                                        semantics='compose_by_gain',
+                                        min_hold_steps=2
+                                    )
                                 )
-                            )
-                            use_u_flags.append(False)
-                else:
-                    controllers = [None for _ in range(batch_size)]
-                    for prog in batch_programs:
-                        use_u_flags.append(self._program_uses_u(prog))
+                                use_u_flags.append(False)
+                    else:
+                        controllers = [None for _ in range(batch_size)]
+                        for prog in batch_programs:
+                            use_u_flags.append(self._program_uses_u(prog))
+
+                    if (self._gpu_executor is not None and self.use_gpu_expression_executor and any(use_u_flags)):
+                        try:
+                            gpu_batch_token = self._gpu_executor.prepare_batch(batch_programs)
+                        except Exception as gpu_batch_exc:
+                            gpu_batch_token = None
+                            if batch_start == 0:
+                                print(f"[GPUExecutor] ⚠️ metrics批次绑定失败，使用CPU路径: {gpu_batch_exc}")
 
             max_steps = int(self.duration * float(getattr(self, '_control_freq', 48)))
             min_steps = int(max_steps * self.min_steps_frac)
@@ -1293,73 +2374,136 @@ class BatchEvaluator:
                 quat = obs['orientation'][:batch_size]
                 vel = obs['velocity'][:batch_size]
                 omega = obs['angular_velocity'][:batch_size]
+                gpu_actions_applied = False
+                if gpu_batch_token is not None:
+                    try:
+                        pos_tensor = self._ensure_tensor(pos)
+                        vel_tensor = self._ensure_tensor(vel)
+                        omega_tensor = self._ensure_tensor(omega)
+                        quat_tensor = self._ensure_tensor(quat)
+                        state_tensors, pos_err_tensor, rpy_tensor = self._prepare_gpu_state_tensors(
+                            pos_tensor, vel_tensor, omega_tensor, quat_tensor, tgt_tensor, integral_states
+                        )
+                        gpu_use_mask = torch.tensor(use_u_flags, dtype=torch.bool, device=self.device)
+                        gpu_outputs = self._gpu_executor.evaluate(
+                            gpu_batch_token,
+                            state_tensors,
+                            gpu_use_mask,
+                            active_mask=(~done_flags_batch)
+                        )
+                        actions[:batch_size, 2:6] = torch.where(
+                            gpu_use_mask.unsqueeze(-1),
+                            gpu_outputs,
+                            actions[:batch_size, 2:6]
+                        )
+                        if self.strict_no_prior:
+                            nz_mask = (
+                                gpu_outputs[:, 0].abs() > 1e-6
+                            ) | (
+                                gpu_outputs[:, 1].abs() > 1e-8
+                            ) | (
+                                gpu_outputs[:, 2].abs() > 1e-8
+                            ) | (
+                                gpu_outputs[:, 3].abs() > 1e-8
+                            )
+                            ever_nonzero |= (gpu_use_mask & nz_mask)
+                        self._update_integral_states(
+                            integral_states,
+                            pos_err_tensor,
+                            rpy_tensor,
+                            done_flags_batch,
+                            float(getattr(self, '_control_dt', 1.0 / 48.0))
+                        )
+                        if not self.strict_no_prior:
+                            self._apply_pid_controllers(
+                                controllers,
+                                use_u_flags,
+                                actions,
+                                step,
+                                pos_tensor,
+                                quat_tensor,
+                                vel_tensor,
+                                omega_tensor,
+                                tgt_np,
+                                integral_states,
+                                ever_nonzero,
+                                debug_enabled,
+                            )
+                        gpu_actions_applied = True
+                    except Exception as gpu_metrics_exc:
+                        gpu_actions_applied = False
+                        if batch_start == 0:
+                            print(f"[GPUExecutor] ⚠️ metrics step 回退CPU: {gpu_metrics_exc}")
 
                 # 为简化，这里复用 evaluate_batch 的标准快速路径（不展开全部超快路径细节），
                 # 但保留正确性：逐程序求值生成 u_*。
-                try:
-                    from scipy.spatial.transform import Rotation
-                except ImportError:
-                    Rotation = None
-                if isinstance(pos, torch.Tensor):
-                    pos_np = pos.cpu().numpy(); quat_np = quat.cpu().numpy(); vel_np = vel.cpu().numpy(); omega_np = omega.cpu().numpy()
-                else:
-                    pos_np = np.asarray(pos); quat_np = np.asarray(quat); vel_np = np.asarray(vel); omega_np = np.asarray(omega)
-                tgt_batch = np.tile(tgt_np, (batch_size, 1))
-                pe_batch = tgt_batch - pos_np
-                if Rotation is not None:
+                if not gpu_actions_applied:
                     try:
-                        rpy_batch = Rotation.from_quat(quat_np).as_euler('XYZ', degrees=False)
-                    except Exception:
-                        rpy_batch = np.zeros((batch_size, 3), dtype=np.float32)
-                else:
-                    rpy_batch = np.zeros((batch_size, 3), dtype=np.float32)
-
-                for i in range(batch_size):
-                    if use_u_flags[i]:
-                        pe = pe_batch[i]; rpy = rpy_batch[i]
-                        state = {
-                            'pos_err_x': float(pe[0]), 'pos_err_y': float(pe[1]), 'pos_err_z': float(pe[2]),
-                            'pos_err': float(np.linalg.norm(pe)), 'pos_err_xy': float(np.linalg.norm(pe[:2])), 'pos_err_z_abs': float(abs(pe[2])),
-                            'vel_x': float(vel_np[i][0]), 'vel_y': float(vel_np[i][1]), 'vel_z': float(vel_np[i][2]), 'vel_err': float(np.linalg.norm(vel_np[i])),
-                            'err_p_roll': float(rpy[0]), 'err_p_pitch': float(rpy[1]), 'err_p_yaw': float(rpy[2]), 'ang_err': float(np.linalg.norm(rpy)), 'rpy_err_mag': float(np.linalg.norm(rpy)),
-                            'ang_vel_x': float(omega_np[i][0]), 'ang_vel_y': float(omega_np[i][1]), 'ang_vel_z': float(omega_np[i][2]), 'ang_vel': float(np.linalg.norm(omega_np[i])), 'ang_vel_mag': float(np.linalg.norm(omega_np[i])),
-                            'err_i_x': float(integral_states[i]['err_i_x']), 'err_i_y': float(integral_states[i]['err_i_y']), 'err_i_z': float(integral_states[i]['err_i_z']),
-                            'err_i_roll': float(integral_states[i]['err_i_roll']), 'err_i_pitch': float(integral_states[i]['err_i_pitch']), 'err_i_yaw': float(integral_states[i]['err_i_yaw']),
-                            'err_d_x': float(-vel_np[i][0]), 'err_d_y': float(-vel_np[i][1]), 'err_d_z': float(-vel_np[i][2]), 'err_d_roll': float(-omega_np[i][0]), 'err_d_pitch': float(-omega_np[i][1]), 'err_d_yaw': float(-omega_np[i][2]),
-                        }
-                        fz, tx, ty, tz = self._eval_program_forces(batch_programs[i], state)
-                        actions[i, 2] = float(fz); actions[i, 3] = float(tx); actions[i, 4] = float(ty); actions[i, 5] = float(tz)
-                        if self.strict_no_prior:
-                            if (abs(fz) > 1e-6) or (abs(tx) > 1e-8) or (abs(ty) > 1e-8) or (abs(tz) > 1e-8):
-                                ever_nonzero[i] = True
-                        if not done_flags[i]:
-                            dt = float(getattr(self, '_control_dt', 1.0/48.0))
-                            integral_states[i]['err_i_x'] += float(pe[0]) * dt
-                            integral_states[i]['err_i_y'] += float(pe[1]) * dt
-                            integral_states[i]['err_i_z'] += float(pe[2]) * dt
-                            integral_states[i]['err_i_roll'] += float(rpy[0]) * dt
-                            integral_states[i]['err_i_pitch'] += float(rpy[1]) * dt
-                            integral_states[i]['err_i_yaw'] += float(rpy[2]) * dt
+                        from scipy.spatial.transform import Rotation
+                    except ImportError:
+                        Rotation = None
+                    if isinstance(pos, torch.Tensor):
+                        pos_np = pos.cpu().numpy(); quat_np = quat.cpu().numpy(); vel_np = vel.cpu().numpy(); omega_np = omega.cpu().numpy()
                     else:
-                        ctrl = controllers[i]
-                        if ctrl is not None:
-                            rpm, _pos_e, _rpy_e = ctrl.computeControl(
-                                self._control_dt,
-                                cur_pos=pos[i], cur_quat=quat[i], cur_vel=vel[i], cur_ang_vel=omega[i], target_pos=tgt_np,
-                            )
-                            rpm = np.clip(np.asarray(rpm, dtype=np.float32), 0.0, 25000.0)
-                            fz, tx, ty, tz = self._rpm_to_forces_local(rpm)
+                        pos_np = np.asarray(pos); quat_np = np.asarray(quat); vel_np = np.asarray(vel); omega_np = np.asarray(omega)
+                    tgt_batch = np.tile(tgt_np, (batch_size, 1))
+                    pe_batch = tgt_batch - pos_np
+                    if Rotation is not None:
+                        try:
+                            rpy_batch = Rotation.from_quat(quat_np).as_euler('XYZ', degrees=False)
+                        except Exception:
+                            rpy_batch = np.zeros((batch_size, 3), dtype=np.float32)
+                    else:
+                        rpy_batch = np.zeros((batch_size, 3), dtype=np.float32)
+
+                    for i in range(batch_size):
+                        if use_u_flags[i]:
+                            pe = pe_batch[i]; rpy = rpy_batch[i]
+                            state = {
+                                'pos_err_x': float(pe[0]), 'pos_err_y': float(pe[1]), 'pos_err_z': float(pe[2]),
+                                'pos_err': float(np.linalg.norm(pe)), 'pos_err_xy': float(np.linalg.norm(pe[:2])), 'pos_err_z_abs': float(abs(pe[2])),
+                                'vel_x': float(vel_np[i][0]), 'vel_y': float(vel_np[i][1]), 'vel_z': float(vel_np[i][2]), 'vel_err': float(np.linalg.norm(vel_np[i])),
+                                'err_p_roll': float(rpy[0]), 'err_p_pitch': float(rpy[1]), 'err_p_yaw': float(rpy[2]), 'ang_err': float(np.linalg.norm(rpy)), 'rpy_err_mag': float(np.linalg.norm(rpy)),
+                                'ang_vel_x': float(omega_np[i][0]), 'ang_vel_y': float(omega_np[i][1]), 'ang_vel_z': float(omega_np[i][2]), 'ang_vel': float(np.linalg.norm(omega_np[i])), 'ang_vel_mag': float(np.linalg.norm(omega_np[i])),
+                                'err_i_x': float(integral_states[i]['err_i_x']), 'err_i_y': float(integral_states[i]['err_i_y']), 'err_i_z': float(integral_states[i]['err_i_z']),
+                                'err_i_roll': float(integral_states[i]['err_i_roll']), 'err_i_pitch': float(integral_states[i]['err_i_pitch']), 'err_i_yaw': float(integral_states[i]['err_i_yaw']),
+                                'err_d_x': float(-vel_np[i][0]), 'err_d_y': float(-vel_np[i][1]), 'err_d_z': float(-vel_np[i][2]), 'err_d_roll': float(-omega_np[i][0]), 'err_d_pitch': float(-omega_np[i][1]), 'err_d_yaw': float(-omega_np[i][2]),
+                            }
+                            fz, tx, ty, tz = self._eval_program_forces(batch_programs[i], state)
                             actions[i, 2] = float(fz); actions[i, 3] = float(tx); actions[i, 4] = float(ty); actions[i, 5] = float(tz)
+                            if self.strict_no_prior:
+                                if (abs(fz) > 1e-6) or (abs(tx) > 1e-8) or (abs(ty) > 1e-8) or (abs(tz) > 1e-8):
+                                    ever_nonzero[i] = True
+                            if not done_flags[i]:
+                                dt = float(getattr(self, '_control_dt', 1.0/48.0))
+                                integral_states[i]['err_i_x'] += float(pe[0]) * dt
+                                integral_states[i]['err_i_y'] += float(pe[1]) * dt
+                                integral_states[i]['err_i_z'] += float(pe[2]) * dt
+                                integral_states[i]['err_i_roll'] += float(rpy[0]) * dt
+                                integral_states[i]['err_i_pitch'] += float(rpy[1]) * dt
+                                integral_states[i]['err_i_yaw'] += float(rpy[2]) * dt
+                        else:
+                            ctrl = controllers[i]
+                            if ctrl is not None:
+                                rpm, _pos_e, _rpy_e = ctrl.computeControl(
+                                    self._control_dt,
+                                    cur_pos=pos[i], cur_quat=quat[i], cur_vel=vel[i], cur_ang_vel=omega[i], target_pos=tgt_np,
+                                )
+                                rpm = np.clip(np.asarray(rpm, dtype=np.float32), 0.0, 25000.0)
+                                fz, tx, ty, tz = self._rpm_to_forces_local(rpm)
+                                actions[i, 2] = float(fz); actions[i, 3] = float(tx); actions[i, 4] = float(ty); actions[i, 5] = float(tz)
                             if self.strict_no_prior:
                                 if (abs(actions[i, 2]) > 1e-6) or (abs(actions[i, 3]) > 1e-8) or (abs(actions[i, 4]) > 1e-8) or (abs(actions[i, 5]) > 1e-8):
                                     ever_nonzero[i] = True
 
-                # 环境步进
+                # 环境步进前应用 MAD 安全壳
+                actions = self._apply_output_mad(actions, use_u_flags, batch_size)
                 obs, step_rewards_env, dones, infos = self._isaac_env_pool.step(actions)
 
-                pos_t = torch.tensor(obs['position'], device=self.device, dtype=torch.float32)
-                vel_t = torch.tensor(obs['velocity'], device=self.device, dtype=torch.float32)
-                omega_t = torch.tensor(obs['angular_velocity'], device=self.device, dtype=torch.float32)
+                tensor_obs = self._isaac_env_pool.get_states_batch()
+                pos_t = tensor_obs['pos']
+                vel_t = tensor_obs['vel']
+                omega_t = tensor_obs['omega']
                 # 动态目标：使用 t 对应的目标
                 if self._step_reward_calc is not None:
                     step_total = self._step_reward_calc.compute_step(
@@ -1401,50 +2545,120 @@ class BatchEvaluator:
                     'position_rmse','settling_time','control_effort','smoothness_jerk',
                     'gain_stability','saturation','peak_error','high_freq']}
 
-            # 零动作惩罚
+            prior_struct = torch.zeros(batch_size, device=self.device)
+            prior_stab = torch.zeros(batch_size, device=self.device)
+
+            # 复杂度激励：奖励使用多变量和多规则的程序
+            if self.complexity_bonus > 0:
+                complexity_rewards = torch.zeros(batch_size, device=self.device)
+                for i in range(batch_size):
+                    prog = batch_programs[i]
+                    unique_vars = set()
+                    for rule in prog:
+                        node = rule.get('node', None)
+                        if node is not None:
+                            vars_in_node = self._extract_variables_from_node(node)
+                            unique_vars.update(vars_in_node)
+                    num_rules = sum(1 for rule in prog if rule.get('node', None) is not None)
+                    bonus_val = self.complexity_bonus * len(unique_vars) + 0.5 * self.complexity_bonus * num_rules
+                    complexity_rewards[i] = bonus_val
+                total_rewards[:batch_size] += complexity_rewards
+
+            prior_bonus = self._compute_prior_bonus(batch_programs)
+            if prior_bonus is not None:
+                total_rewards[:batch_size] += prior_bonus[0]
+                prior_struct = prior_bonus[1]
+                prior_stab = prior_bonus[2]
+
+            # 🔍 分离真实奖励和训练奖励
+            # reward_true: 纯环境奖励（不含人工惩罚）
+            # reward_train: 训练信号（含零动作惩罚等）
+            batch_rewards_true = total_rewards[:batch_size].clone()
+            batch_rewards_train = total_rewards[:batch_size].clone()
+            
+            # 零动作惩罚：仅加到训练奖励上
+            zero_penalty_applied = torch.zeros(batch_size, device=self.device)
             if self.strict_no_prior and self.zero_action_penalty > 0:
                 zero_mask = (~ever_nonzero).float()
-                total_rewards[:batch_size] -= self.zero_action_penalty * zero_mask
+                zero_penalty_applied = self.zero_action_penalty * zero_mask
+                batch_rewards_train -= zero_penalty_applied
 
-            # 归约
+            # 归约（对两个奖励分别处理）
             if self.reward_reduction == 'mean':
                 denom = torch.clamp(steps_count[:batch_size], min=1.0)
-                batch_scores = (total_rewards[:batch_size] / denom).cpu().numpy().tolist()
+                batch_scores_true = (batch_rewards_true / denom).cpu().numpy().tolist()
+                batch_scores_train = (batch_rewards_train / denom).cpu().numpy().tolist()
             else:
-                batch_scores = total_rewards[:batch_size].cpu().numpy().tolist()
-            rewards.extend(batch_scores)
+                batch_scores_true = batch_rewards_true.cpu().numpy().tolist()
+                batch_scores_train = batch_rewards_train.cpu().numpy().tolist()
+            
+            # rewards列表存储训练奖励（向后兼容，用于NN训练）
+            rewards.extend(batch_scores_train)
+            # rewards_true列表存储真实奖励（用于保存、输出、对比）
+            rewards_true.extend(batch_scores_true)
 
-            # 逐环境组件字典（加入 finalize_bonus）
+            # 逐环境组件字典（加入 finalize_bonus + zero_penalty）
             comp_totals['finalize_bonus'] = bonus_vec
+            comp_totals['zero_action_penalty'] = zero_penalty_applied
+            comp_totals['structure_prior'] = prior_struct
+            comp_totals['stability_prior'] = prior_stab
             for i in range(batch_size):
                 d = {k: float(comp_totals[k][i].item()) for k in comp_totals.keys()}
                 metrics_all.append(d)
 
         elapsed = time.time() - start_time
         display_count = num_programs_original if self.replicas_per_program > 1 else num_programs
-        print(f"[BatchEvaluator] ✅ 评估完成: {display_count} 程序 (×{self.replicas_per_program} replicas), {elapsed:.2f}秒 ({elapsed/display_count*1000:.1f}ms/程序)")
+        # 注释掉详细评估日志，减少输出噪音
+        # print(f"[BatchEvaluator] ✅ 评估完成: {display_count} 程序 (×{self.replicas_per_program} replicas), {elapsed:.2f}秒 ({elapsed/display_count*1000:.1f}ms/程序)")
 
         # 汇总 replicas：对每个原始程序的组件逐键取平均
         if self.replicas_per_program > 1:
             averaged_rewards: List[float] = []
+            averaged_rewards_true: List[float] = []
             averaged_metrics: List[Dict[str, float]] = []
             for i in range(num_programs_original):
                 start_idx = i * self.replicas_per_program
                 end_idx = start_idx + self.replicas_per_program
                 avg_reward = float(np.mean(rewards[start_idx:end_idx]))
+                avg_reward_true = float(np.mean(rewards_true[start_idx:end_idx]))
                 averaged_rewards.append(avg_reward)
+                averaged_rewards_true.append(avg_reward_true)
                 # 平均组件
                 keys = list(metrics_all[start_idx].keys())
                 avg_dict = {k: float(np.mean([metrics_all[j][k] for j in range(start_idx, end_idx)])) for k in keys}
                 averaged_metrics.append(avg_dict)
-            return averaged_rewards, averaged_metrics
+            if len(valid_indices) == total_requested:
+                return averaged_rewards, averaged_rewards_true, averaged_metrics
+            return self._merge_metrics_with_invalid(
+                valid_indices,
+                averaged_rewards,
+                averaged_rewards_true,
+                averaged_metrics,
+                invalid_info,
+                total_requested,
+            )
 
-        return rewards, metrics_all
+        if len(valid_indices) == total_requested:
+            return rewards, rewards_true, metrics_all
+        return self._merge_metrics_with_invalid(
+            valid_indices,
+            rewards,
+            rewards_true,
+            metrics_all,
+            invalid_info,
+            total_requested,
+        )
 
-    def evaluate_single_with_metrics(self, program: List[Dict[str, Any]]) -> Tuple[float, Dict[str, float]]:
-        """评估单个程序（支持 replicas），返回奖励与组件字典。"""
-        rewards, metrics = self.evaluate_batch_with_metrics([program])
-        return rewards[0], metrics[0]
+    def evaluate_single_with_metrics(self, program: List[Dict[str, Any]]) -> Tuple[float, float, Dict[str, float]]:
+        """评估单个程序（支持 replicas），返回训练奖励、真实奖励与组件字典。
+        
+        Returns:
+            reward_train: 训练奖励（含惩罚）
+            reward_true: 真实奖励（不含惩罚）
+            components: 组件字典
+        """
+        rewards_train, rewards_true, metrics = self.evaluate_batch_with_metrics([program])
+        return rewards_train[0], rewards_true[0], metrics[0]
     
     def _compute_action_from_program(self, program: List[Dict[str, Any]], 
                                       obs: np.ndarray, step: int) -> np.ndarray:
@@ -1472,12 +2686,39 @@ class BatchEvaluator:
     
     def evaluate_single(self, program: List[Dict[str, Any]]) -> float:
         """评估单个程序：可并行复制多个副本并取平均，提升GPU利用率/稳定性"""
-        if self.replicas_per_program <= 1:
-            return self.evaluate_batch([program])[0]
-        else:
-            programs = [program] * self.replicas_per_program
-            rewards = self.evaluate_batch(programs)
-            return float(np.mean(rewards))
+        # evaluate_batch 会自动处理 replicas，不需要在这里复制
+        rewards = self.evaluate_batch([program])
+        return float(np.mean(rewards))
+    
+    def evaluate_batch_programs(self, programs: List[List[Dict[str, Any]]]) -> List[float]:
+        """批量评估多个程序（用于 MCTS 叶节点并行化）
+        
+        这个方法专门为 MCTS 并行化设计，支持一次评估多个不同的程序。
+        每个程序仍然使用完整的 isaac_num_envs 环境评估，但通过连续调用
+        减少 Python/Isaac Gym 的开销。
+        
+        Args:
+            programs: 程序列表，每个程序是 List[Dict[str, Any]]
+            
+        Returns:
+            rewards_train: 训练奖励列表（含惩罚）
+            
+        Example:
+            >>> programs = [program1, program2, program3]
+            >>> rewards = evaluator.evaluate_batch_programs(programs)
+            >>> # rewards = [-1.5, -2.3, -0.8]
+        """
+        if not programs:
+            return []
+        
+        # 连续评估每个程序（仍使用完整的 isaac_num_envs）
+        # 注意：这里不是真正的"并行"，而是减少调用开销
+        rewards_train = []
+        for program in programs:
+            reward_train, _, _ = self.evaluate_single_with_metrics(program)
+            rewards_train.append(reward_train)
+        
+        return rewards_train
 
 
 # 测试代码

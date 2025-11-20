@@ -8,9 +8,8 @@ from __future__ import annotations
 from typing import Dict, List, Tuple, Any, Optional, TYPE_CHECKING
 
 EDIT_TYPES: List[str] = [
-    'add_rule','remove_rule','mutate_condition','mutate_action','tweak_multiplier','micro_tweak',
-    'nudge_threshold','narrow_condition','promote_rule','split_rule','duplicate_rule','swap_rules',
-    'macro_triplet_tune','macro_refine_condition'
+    'add_rule','remove_rule','mutate_action','tweak_multiplier','micro_tweak',
+    'promote_rule','duplicate_rule','swap_rules','macro_triplet_tune'
 ]
 
 TORCH_AVAILABLE = False

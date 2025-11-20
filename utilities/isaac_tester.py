@@ -19,7 +19,17 @@ if spec and spec.loader:
 else:
     raise ImportError('Failed to load IsaacGymDroneEnv')
 
-from reward import RewardCalculator
+# 加载奖励计算器（从 01_pi_flight/utils）
+_REWARD_FILE = os.path.join(_ROOT, '01_pi_flight', 'utils', 'reward_stepwise.py')
+_REWARD_MOD_NAME = 'piflight_utils.reward_stepwise'
+spec_reward = importlib.util.spec_from_file_location(_REWARD_MOD_NAME, _REWARD_FILE)
+if spec_reward and spec_reward.loader:
+    _reward_mod = importlib.util.module_from_spec(spec_reward)
+    sys.modules[_REWARD_MOD_NAME] = _reward_mod
+    spec_reward.loader.exec_module(_reward_mod)  # type: ignore
+    RewardCalculator = getattr(_reward_mod, 'StepwiseRewardCalculator')
+else:
+    raise ImportError('Failed to load StepwiseRewardCalculator')
 
 # 轻量 CPU 后备环境（当 Isaac Gym 不可用时用于冒烟测试）
 class SimpleCPUHoverEnv:
@@ -140,7 +150,9 @@ class SimulationTester:
     def run(self) -> float:
         traj_df = self._generate_trajectory_dataframe()
         effective_dt = self.CONTROL_TIMESTEP * self.log_skip
-        reward_calculator = RewardCalculator(weights=self.weights, target_pos=self.INITIAL_XYZ[0], dt=effective_dt, trajectory_df=traj_df)
+        # StepwiseRewardCalculator 初始化参数: weights, ks, dt, num_envs, device
+        default_ks = {'K_VZ': 0.2, 'K_VAR': 0.1}  # 默认控制系数
+        reward_calculator = RewardCalculator(weights=self.weights, ks=default_ks, dt=effective_dt, num_envs=1, device='cpu')
         # 创建/复用 Isaac Gym 单环境
         global _ENV_SINGLETON
         if _ENV_SINGLETON is None:
@@ -219,6 +231,19 @@ class SimulationTester:
         ])
         cols = ['timestamp','x','y','z','r','p','y_angle','vx','vy','vz','wx','wy','wz','rpm0','rpm1','rpm2','rpm3']
         log_df = pd.DataFrame(data, columns=cols)
-        final_reward = reward_calculator.compute_reward(log_df, disturbance_times, verbose=not self.quiet)
+        
+        # 简化的烟测评分：计算位置RMSE
+        target_pos = self.INITIAL_XYZ[0]
+        pos_errors = np.sqrt((log_df['x'] - target_pos[0])**2 + 
+                            (log_df['y'] - target_pos[1])**2 + 
+                            (log_df['z'] - target_pos[2])**2)
+        final_score = -np.mean(pos_errors)  # 负值因为越小越好
+        
+        if not self.quiet:
+            print(f"烟测完成:")
+            print(f"  平均位置误差: {np.mean(pos_errors):.4f}m")
+            print(f"  最大位置误差: {np.max(pos_errors):.4f}m")
+            print(f"  最终得分: {final_score:.4f}")
+        
         # 单例环境不在此关闭，进程结束由外部回收
-        return float(final_reward)
+        return float(final_score)

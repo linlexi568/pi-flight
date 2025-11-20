@@ -12,6 +12,24 @@ except Exception:
         sys.path.insert(0, str(_parent))
     from core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 
+try:
+    from ..utils.prior_scoring import compute_prior_scores
+except Exception:
+    try:
+        from utils.prior_scoring import compute_prior_scores  # type: ignore
+    except Exception:
+        compute_prior_scores = None  # type: ignore
+
+try:
+    from ..utils.program_constraints import CHANNEL_ALLOWED_INPUTS, allowed_variables_for_channel
+except Exception:
+    try:
+        from utils.program_constraints import CHANNEL_ALLOWED_INPUTS, allowed_variables_for_channel  # type: ignore
+    except Exception:
+        CHANNEL_ALLOWED_INPUTS = {}
+        def allowed_variables_for_channel(channel: str, available):  # type: ignore
+            return list(available)
+
 class MCTSNode:
     """Tree node with progressive widening & action cache.
 
@@ -56,7 +74,9 @@ class MCTS_Agent:
                  pw_alpha: float = 0.6,
                  pw_c: float = 1.5,
                  transposition: bool = True,
-                 warm_start_program: Optional[list] = None):
+                 warm_start_program: Optional[list] = None,
+                 structure_prior_weight: float = 0.0,
+                 stability_prior_weight: float = 0.0):
         self.evaluation_function = evaluation_function
         self.dsl_variables = dsl_variables
         self.dsl_constants = dsl_constants
@@ -68,6 +88,8 @@ class MCTS_Agent:
         self.pw_alpha = pw_alpha
         self.pw_c = pw_c
         self.use_transposition = transposition
+        self.structure_prior_weight = float(structure_prior_weight)
+        self.stability_prior_weight = float(stability_prior_weight)
         # 额外 ε-greedy 探索概率（可由外部动态调度）
         self.epsilon: float = 0.0
         if warm_start_program:
@@ -144,6 +166,18 @@ class MCTS_Agent:
         self._edit_prior_c = 0.0  # type: float
         # Optional online hook: (node, candidate_types: List[str], chosen_type: str) -> None
         self._edit_online_hook = None  # type: Optional[Callable[[MCTSNode, List[str], str], None]]
+        
+        # ============================================================================
+        # Ranking-based prior bias (for plateau breaking)
+        # ============================================================================
+        # Ranking network instance (optional; if provided, used to bias child selection)
+        self.ranking_net = None  # type: Optional[Any]
+        # GNN encoder for getting program embeddings (required if ranking_net is set)
+        self.gnn_encoder = None  # type: Optional[Any]
+        # Ranking bias strength (beta in exp(beta * ranking_score))
+        self.ranking_bias_beta = 0.0  # type: float
+        # Device for ranking inference
+        self.ranking_device = None  # type: Optional[Any]
 
         # --- AlphaZero-lite options (default OFF) ---
         # Enable PUCT selection in _uct_select_child
@@ -384,9 +418,40 @@ class MCTS_Agent:
         # epsilon-greedy fallback
         if getattr(self, 'epsilon', 0.0) > 0 and random.random() < self.epsilon:
             return random.choice(node.children)
+        
+        # 🌟 Ranking-based prior bias (if available)
+        ranking_scores = {}
+        if (self.ranking_net is not None and self.gnn_encoder is not None and 
+            self.ranking_bias_beta > 0 and self.ranking_device is not None):
+            try:
+                import torch
+                with torch.no_grad():
+                    for idx, child in enumerate(node.children):
+                        # Get GNN embedding for child program
+                        from ..ast_pipeline import program_to_graph
+                        graph_data = program_to_graph(child.program)
+                        if graph_data is not None:
+                            # Convert to batch format
+                            batch_graphs = [graph_data]
+                            embed = self.gnn_encoder.get_embedding(batch_graphs, self.ranking_device)
+                            # Get ranking value score
+                            # Assuming action features are zero for now (can be enhanced later)
+                            action_feat = torch.zeros(1, 6, device=self.ranking_device)
+                            score = self.ranking_net.forward_value(embed, action_feat).item()
+                            ranking_scores[idx] = score
+            except Exception as e:
+                # Silently fall back if ranking fails
+                pass
+        
         for idx, child in enumerate(node.children):
             q = float(child.reward) if child.visits>0 else 0.0
             p = float(getattr(child, '_prior_p', 0.0) or 0.0)
+            
+            # 🌟 Apply ranking bias to prior
+            if idx in ranking_scores:
+                ranking_bonus = math.exp(self.ranking_bias_beta * ranking_scores[idx])
+                p = p * ranking_bonus
+            
             u = c_puct * p * (sqrt_total / (1.0 + float(child.visits)))
             score = q + u
             if score > best_score:
@@ -684,7 +749,20 @@ class MCTS_Agent:
             decay = 1.0 - (p / max(1e-6, float(getattr(self, '_diversity_end_progress', 0.30))))
             div_bonus = div_max * (0.6 * narrow_score + 0.4 * var_div) * max(0.0, decay)
         strict_bonus = float(getattr(self, '_strict_bonus_scale', 0.0)) * self._estimate_strictness(node.program)
-        return penalized + 0.1 * rollout_bonus + div_bonus + strict_bonus
+        prior_bonus = 0.0
+        if compute_prior_scores is not None and (
+            abs(getattr(self, 'structure_prior_weight', 0.0)) > 1e-9 or
+            abs(getattr(self, 'stability_prior_weight', 0.0)) > 1e-9
+        ):
+            try:
+                scores = compute_prior_scores(node.program)
+                prior_bonus = (
+                    float(self.structure_prior_weight) * float(scores.get('structure', 0.0)) +
+                    float(self.stability_prior_weight) * float(scores.get('stability', 0.0))
+                )
+            except Exception:
+                prior_bonus = 0.0
+        return penalized + 0.1 * rollout_bonus + div_bonus + strict_bonus + prior_bonus
     def _rollout(self, program: list, depth: int) -> float:
         cur = copy.deepcopy(program)
         best = -float('inf')
@@ -714,6 +792,145 @@ class MCTS_Agent:
             pass
     def get_best_program(self):
         return self._global_best_program, self._global_best_reward
+    
+    def search_with_leaf_parallel(self, iterations: int, leaf_batch_size: int = 8, 
+                                   total_target: Optional[int] = None):
+        """MCTS 搜索（叶节点批量评估版本）
+        
+        这个方法实现了 Leaf Parallelization：
+        1. Selection/Expansion 仍然串行（避免树竞争条件）
+        2. 积累 N 个待评估的叶节点
+        3. 批量提交评估（减少 Python/Isaac Gym 开销）
+        4. 依次 Backpropagation
+        
+        Args:
+            iterations: MCTS 迭代次数
+            leaf_batch_size: 叶节点批量大小（推荐 4-10）
+            total_target: 总迭代数（用于动态调度）
+            
+        Note:
+            - 每个程序仍使用完整的 isaac_num_envs 评估
+            - 不是真正的并行，而是减少评估调用开销
+            - 保持与原 search() 相同的树更新逻辑
+        """
+        # 检查 evaluation_function 是否支持批量评估
+        has_batch_eval = hasattr(self.evaluation_function, '__self__') and \
+                        hasattr(self.evaluation_function.__self__, 'evaluate_batch_programs')
+        
+        if not has_batch_eval:
+            # 回退到原始 search 方法
+            print("  ⚠️  评估器不支持批量评估，回退到串行模式")
+            return self.search(iterations, total_target)
+        
+        pending_nodes = []  # 待评估的节点列表
+        
+        for i in range(iterations):
+            # 动态调度（与原 search() 相同）
+            if total_target:
+                progress = (self.total_iterations_done + 1) / total_target
+                self._progress = progress
+                # epsilon 调度
+                end_p = max(1e-6, float(getattr(self, '_epsilon_end_progress', 0.30)))
+                emax = float(getattr(self, '_epsilon_max', 0.25))
+                if progress < end_p:
+                    self.epsilon = emax * (1 - progress / end_p)
+                else:
+                    self.epsilon = 0.0
+                if self.total_iterations_done < getattr(self, '_rebound_until_iter', 0):
+                    self.epsilon = max(self.epsilon, float(getattr(self, '_epsilon_rebound', 0.18)))
+                # 复杂度惩罚调度
+                min_s = getattr(self, '_complexity_min_scale', 0.5)
+                max_s = getattr(self, '_complexity_max_scale', 1.5)
+                r_start = getattr(self, '_complexity_ramp_start', 0.30)
+                r_end = getattr(self, '_complexity_ramp_end', 0.70)
+                if progress <= r_start:
+                    scale = min_s
+                elif progress >= r_end:
+                    scale = max_s
+                else:
+                    ratio = (progress - r_start) / max(1e-9, (r_end - r_start))
+                    scale = min_s + (max_s - min_s) * ratio
+                self._dynamic_complexity = self.complexity_penalty * scale
+                # 最少规则下限
+                g0 = getattr(self, '_min_rules_guard_initial', self._min_rules_guard)
+                g1 = getattr(self, '_min_rules_guard_final', self._min_rules_guard)
+                gs = getattr(self, '_min_rules_ramp_start', 0.30)
+                ge = getattr(self, '_min_rules_ramp_end', 0.70)
+                if progress <= gs:
+                    g_eff = g0
+                elif progress >= ge:
+                    g_eff = g1
+                else:
+                    ratio = (progress - gs) / max(1e-9, (ge - gs))
+                    g_eff = int(round(g0 + (g1 - g0) * ratio))
+                self._min_rules_guard_effective = max(1, int(g_eff))
+            
+            # Selection: 选择一个叶节点
+            node = self._select(self.root)
+            pending_nodes.append(node)
+            
+            # 积累到 batch_size 个，或者是最后一批
+            if len(pending_nodes) >= leaf_batch_size or i == iterations - 1:
+                # 批量评估
+                programs = [n.program for n in pending_nodes]
+                try:
+                    evaluator = self.evaluation_function.__self__
+                    rewards = evaluator.evaluate_batch_programs(programs)
+                except Exception as e:
+                    # 批量评估失败，回退到逐个评估
+                    print(f"  ⚠️  批量评估失败: {e}，回退到逐个评估")
+                    rewards = [self.evaluation_function(prog) for prog in programs]
+                
+                # 依次 Backpropagation 和更新全局最佳
+                for node, reward in zip(pending_nodes, rewards):
+                    # Bandit credit assignment
+                    try:
+                        act = getattr(node, '_applied_action', None)
+                        if act is not None and isinstance(act, tuple) and len(act) >= 1:
+                            base = getattr(node, '_applied_parent_reward', None)
+                            if base is None and node.parent is not None and node.parent.visits > 0:
+                                base = node.parent.reward
+                            base_val = float(base) if isinstance(base, (int, float)) else 0.0
+                            if getattr(self, '_edit_credit_mode', 'off') == 'ucb':
+                                self._update_edit_credit(str(act[0]), float(reward) - base_val)
+                    except Exception:
+                        pass
+                    
+                    # Backpropagation
+                    self._backpropagate(node, reward)
+                    self.total_iterations_done += 1
+                    
+                    # 更新全局最佳（与原 search() 相同的逻辑）
+                    if reward > self._global_best_reward:
+                        accepted = True
+                        accepted_reward = reward
+                        _vcb = getattr(self, 'verify_callback', None)
+                        if _vcb is not None and callable(_vcb):
+                            try:
+                                _res = _vcb(node.program, reward, self.total_iterations_done)
+                                _acpt = False
+                                _full_r = None
+                                if isinstance(_res, tuple):
+                                    if len(_res) >= 1:
+                                        _acpt = bool(_res[0])
+                                    if len(_res) >= 2 and isinstance(_res[1], (int, float)):
+                                        _full_r = float(_res[1])
+                                else:
+                                    _acpt = bool(_res)
+                                accepted = bool(_acpt)
+                                if accepted and _full_r is not None:
+                                    accepted_reward = _full_r
+                            except Exception:
+                                accepted = True
+                                accepted_reward = reward
+                        if accepted:
+                            self._global_best_reward = accepted_reward
+                            self._global_best_program = [self._clone_rule(r) for r in node.program]
+                            self._last_improve_iter = self.total_iterations_done
+                
+                # 清空待评估列表
+                pending_nodes.clear()
+    
     def set_verify_callback(self, cb: Optional[Union[Callable[[list, float, int], Tuple[bool, Optional[float]]], Callable[..., tuple]]]):
         """Set gating verify callback; any callable that returns (accepted:bool, full_reward:Optional[float]) is OK."""
         if cb is None:
@@ -775,14 +992,18 @@ class MCTS_Agent:
         if not isinstance(program,list): return str(program)
         rule_strings=[]
         for i,rule in enumerate(program):
-            condition_str=self._ast_to_str(rule['condition'])
+            cond_node = rule.get('condition')
+            condition_str=self._ast_to_str(cond_node) if cond_node is not None else 'TRUE'
             action_parts=[]
             for act in rule['action']:
                 if isinstance(act,BinaryOpNode) and act.op=='set' and isinstance(act.left,TerminalNode):
                     rstr = self._ast_to_str(act.right) if hasattr(act, 'right') else '0'
                     action_parts.append(f"{act.left.value} = {rstr}")
             action_str=", ".join(action_parts)
-            rule_strings.append(f"  Rule {i}: IF ({condition_str}) THEN ({action_str})")
+            if cond_node is None or (isinstance(cond_node, TerminalNode) and str(cond_node.value) in ('1','1.0','True')):
+                rule_strings.append(f"  Rule {i}: {action_str}")
+            else:
+                rule_strings.append(f"  Rule {i}: IF ({condition_str}) THEN ({action_str})")
         return "\n"+"\n".join(rule_strings)
     # --- Mutation action system ---
     def _ensure_mutations(self, node: MCTSNode):
@@ -797,19 +1018,14 @@ class MCTS_Agent:
         if node.program:
             for idx in range(len(node.program)):
                 actions.append(('remove_rule', idx))
-                actions.append(('mutate_condition', idx))
                 actions.append(('mutate_action', idx))
                 actions.append(('tweak_multiplier', idx))
                 # 细粒度抛光：更小步幅的增益与阈值微调
                 actions.append(('micro_tweak', idx))
-                actions.append(('nudge_threshold', idx))
-                actions.append(('narrow_condition', idx))
                 actions.append(('promote_rule', idx))
-                actions.append(('split_rule', idx))
                 # Macro actions (optional)
                 if getattr(self, '_enable_macros', False):
                     actions.append(('macro_triplet_tune', idx))
-                    actions.append(('macro_refine_condition', idx))
                 if self._enable_duplicate_rule and len(node.program) < getattr(self, '_max_rules', 8):
                     actions.append(('duplicate_rule', idx))
             if len(node.program) > 1:
@@ -837,33 +1053,10 @@ class MCTS_Agent:
             guard_limit = max(1, getattr(self, '_min_rules_guard_effective', getattr(self, '_min_rules_guard', 1)))
             if len(program) > guard_limit and 0 <= idx < len(program):
                 program.pop(idx)
-        elif mutation_type == 'mutate_condition':
-            idx = payload
-            if 0 <= idx < len(program):
-                c_new = self._generate_random_condition()
-                program[idx]['condition'] = self._enforce_narrow_condition(c_new)
         elif mutation_type == 'mutate_action':
             idx = payload
             if 0 <= idx < len(program):
                 program[idx]['action'] = self._generate_random_action()
-        elif mutation_type == 'narrow_condition':
-            idx = payload
-            if 0 <= idx < len(program):
-                cond = program[idx]['condition']
-                if isinstance(cond, BinaryOpNode) and cond.op in ('<','>') and isinstance(cond.right, TerminalNode) and isinstance(cond.right.value, (int,float)):
-                    T = float(cond.right.value)
-                    if cond.op == '<':
-                        if T >= 0:
-                            T_new = T * random.uniform(0.75, 0.92)  # 收紧: 原 0.5-0.85
-                        else:
-                            T_new = T * random.uniform(0.90, 1.0)
-                    else:
-                        if T >= 0:
-                            T_new = T * random.uniform(1.08, 1.30)  # 收紧: 原 1.15-1.6
-                        else:
-                            T_new = T * random.uniform(0.75, 0.92)
-                    cond.right = TerminalNode(round(float(T_new), 4))
-                    program[idx]['condition'] = self._enforce_narrow_condition(cond)
         elif mutation_type == 'tweak_multiplier':
             # 泛化为：微调动作表达式中的常数项
             idx = payload
@@ -910,18 +1103,6 @@ class MCTS_Agent:
                         n.value = round(float(n.value) * noise, 4)  # type: ignore[attr-defined]
                     except Exception:
                         pass
-        elif mutation_type == 'nudge_threshold':
-            # 条件阈值的微幅调整，便于在边缘处找到增益
-            idx = payload
-            if 0 <= idx < len(program):
-                cond = program[idx]['condition']
-                if isinstance(cond, BinaryOpNode) and cond.op in ('<','>') and isinstance(cond.right, TerminalNode) and isinstance(cond.right.value,(int,float)):
-                    T = float(cond.right.value)
-                    # 微小比例因子；保持正负号不变
-                    factor = random.uniform(0.97, 1.03)
-                    T_new = T * factor
-                    cond.right = TerminalNode(round(T_new, 4))
-                    program[idx]['condition'] = self._enforce_narrow_condition(cond)
         elif mutation_type == 'duplicate_rule':
             idx = payload
             if 0 <= idx < len(program) and len(program) < MAX_RULES:
@@ -947,7 +1128,7 @@ class MCTS_Agent:
                         except Exception:
                             pass
                 else:
-                    new_rule['condition'] = self._generate_random_condition()
+                    new_rule['condition'] = TerminalNode(1.0)
                 program.append(new_rule)
         elif mutation_type == 'promote_rule':
             idx = payload
@@ -956,38 +1137,6 @@ class MCTS_Agent:
                 new_pos = max(0, idx - step)
                 rule = program.pop(idx)
                 program.insert(new_pos, rule)
-        elif mutation_type == 'split_rule':
-            idx = payload
-            if 0 <= idx < len(program):
-                cond = program[idx].get('condition')
-                acts = [a for a in program[idx].get('action', [])]
-                if isinstance(cond, BinaryOpNode) and cond.op in ('<','>') and isinstance(cond.right, TerminalNode) and isinstance(cond.right.value,(int,float)):
-                    T = float(cond.right.value)
-                    if cond.op == '<':
-                        f1, f2 = random.uniform(0.5, 0.75), random.uniform(0.75, 0.9)
-                        c1 = BinaryOpNode('<', cond.left, TerminalNode(round(T * f1, 4)))
-                        c2 = BinaryOpNode('<', cond.left, TerminalNode(round(T * f2, 4)))
-                    else:
-                        base = max(T, 0.05)
-                        f1, f2 = random.uniform(1.2, 1.8), random.uniform(1.8, 2.6)
-                        c1 = BinaryOpNode('>', cond.left, TerminalNode(round(base * f1, 4)))
-                        c2 = BinaryOpNode('>', cond.left, TerminalNode(round(base * f2, 4)))
-                    c1 = self._enforce_narrow_condition(c1)
-                    c2 = self._enforce_narrow_condition(c2)
-                    def _jitter(asrc:list):
-                        outs = [a for a in asrc]
-                        mult_nodes=[a for a in outs if isinstance(a,BinaryOpNode) and a.op=='set']
-                        for mn in mult_nodes:
-                            if isinstance(mn.right, TerminalNode) and isinstance(mn.right.value,(int,float)):
-                                mn.right = TerminalNode(round(float(mn.right.value)*random.uniform(0.9,1.15),4))
-                        return outs
-                    r1 = {'condition': c1, 'action': _jitter(acts)}
-                    r2 = {'condition': c2, 'action': _jitter(acts)}
-                    program.pop(idx)
-                    if len(program) < MAX_RULES:
-                        program.insert(idx, r2)
-                    if len(program) < MAX_RULES:
-                        program.insert(idx, r1)
         elif mutation_type == 'swap_rules':
             i1,i2 = payload
             if 0 <= i1 < len(program) and 0 <= i2 < len(program) and i1!=i2:
@@ -1012,117 +1161,14 @@ class MCTS_Agent:
                 for a in acts:
                     if isinstance(a, BinaryOpNode) and a.op == 'set' and hasattr(a, 'right'):
                         scale_consts(a.right)
-        elif mutation_type == 'macro_refine_condition':
-            idx = payload
-            if 0 <= idx < len(program):
-                # compound: narrow then nudge
-                program = self._apply_mutation(program, ('narrow_condition', idx))
-                program = self._apply_mutation(program, ('nudge_threshold', idx))
         return program
     def _generate_random_rule(self)->Dict[str,Any]:
-        return {'condition': self._generate_random_condition(), 'action': self._generate_random_action()}
+        return {'condition': self._always_true_condition(), 'action': self._generate_random_action()}
+
+    def _always_true_condition(self) -> TerminalNode:
+        return TerminalNode(1.0)
     def _generate_random_segmented_program(self,num_rules=2)->list:
         return [self._generate_random_rule() for _ in range(num_rules)]
-    def _generate_random_condition(self,depth=0,max_depth=3)->ProgramNode:
-        import random, math
-        comparators = ['>', '<']
-        # 主运算: trig + tan + 幅度压缩函数
-        unary_ops_primary = ['sin', 'cos', 'tan', 'log1p', 'sqrt']
-        # 次级包裹：符号 / 绝对值（平滑或折叠）
-        unary_ops_secondary = ['abs', 'sign']
-
-        def maybe_unary(node: ProgramNode, p_primary: float, p_secondary: float, allow_second_layer: bool = True):
-            """随机包裹一元函数；primary 为 trig/log1p/sqrt/tan，secondary 为 abs/sign。
-            allow_second_layer 控制是否允许在 primary 外再包一层 abs 以平滑极值。"""
-            allowed = getattr(self, '_allowed_cond_unaries', set(['identity','abs']))
-            # primary 集合与白名单的交集
-            prim_pool = [op for op in unary_ops_primary if op in allowed]
-            sec_pool = [op for op in unary_ops_secondary if op in allowed]
-            if prim_pool and random.random() < p_primary:  # 触发 primary 类且已允许
-                op = random.choice(prim_pool)
-                node = UnaryOpNode(op, node)
-                if allow_second_layer and sec_pool and random.random() < p_secondary:  # 少量再包 abs/sign
-                    node = UnaryOpNode(random.choice(sec_pool), node)
-                return node
-            # 未触发 primary，则小概率只包 abs/sign
-            if sec_pool and random.random() < p_secondary:
-                op2 = random.choice(sec_pool)
-                return UnaryOpNode(op2, node)
-            return node
-
-        # 根层：基变量 + 一元包裹 + 与常量阈值比较
-        if depth == 0:
-            base_var = TerminalNode(random.choice(self.dsl_variables))
-            # 仅依据允许集合决定是否包一元
-            base_var = maybe_unary(base_var, p_primary=0.35, p_secondary=0.10, allow_second_layer=True)
-            # 按变量/一元操作类型设置阈值分布（为常见变量采用更保守的阈值范围，避免宽条件）
-            if isinstance(base_var, UnaryOpNode):
-                opn = base_var.op
-                if opn in ('sin', 'cos'):
-                    thresh_val = random.uniform(-1.0, 1.0)
-                elif opn == 'tan':
-                    thresh_val = random.uniform(-5.0, 5.0)
-                elif opn == 'log1p':
-                    thresh_val = random.uniform(0.0, 2.5)  # log1p(|x|) >= 0
-                elif opn == 'sqrt':
-                    thresh_val = random.uniform(0.0, 3.0)
-                else:  # abs/sign or nested abs of primary
-                    base = random.choice(self.dsl_constants)
-                    noise = random.uniform(0.5, 1.3)
-                    thresh_val = base * noise
-            else:
-                # 对关键变量采用更保守的随机范围
-                if isinstance(base_var, TerminalNode) and isinstance(base_var.value, str):
-                    var_name = base_var.value
-                    thresh_val = self._sample_threshold_for_variable(var_name)
-                else:
-                    base = random.choice(self.dsl_constants)
-                    noise = random.uniform(0.5, 1.3)
-                    thresh_val = base * noise
-            thresh = TerminalNode(round(float(thresh_val), 4))
-            op = random.choice(comparators)
-            root = BinaryOpNode(op, base_var, thresh)
-            try:
-                return self._enforce_narrow_condition(root)
-            except Exception:
-                return root
-
-        # 叶：返回变量或常量（优先变量），再做一元包裹
-        if depth >= max_depth or random.random() < 0.5:
-            if random.random() < 0.8:
-                term = TerminalNode(random.choice(self.dsl_variables))
-            else:
-                term = TerminalNode(random.choice(self.dsl_constants))
-            return maybe_unary(term, p_primary=0.40, p_secondary=0.12, allow_second_layer=True)
-
-        # 内部节点：递归生成左右再比较
-        left = self._generate_random_condition(depth + 1, max_depth)
-        right = self._generate_random_condition(depth + 1, max_depth)
-        # 避免左右都是纯常量（使条件失去动态性）
-        if isinstance(left, TerminalNode) and isinstance(right, TerminalNode) and not (isinstance(left.value, str) or isinstance(right.value, str)):
-            left = TerminalNode(random.choice(self.dsl_variables))
-        op = random.choice(comparators)
-        return BinaryOpNode(op, left, right)
-
-    # --- Helper: 阈值抽样更保守（避免宽条件）---
-    def _sample_threshold_for_variable(self, var_name: str) -> float:
-        import random
-        # 针对常见变量设置“更保守”的范围；数值可按数据分布微调
-        if var_name == 'pos_err_z':
-            return random.uniform(0.1, 0.9)   # 原来可到 2~3m，现在收紧到 <1m
-        if var_name == 'pos_err_xy':
-            return random.uniform(0.2, 1.2)
-        if var_name in ('ang_vel_x', 'ang_vel_y', 'ang_vel_mag'):
-            return random.uniform(0.3, 2.0)
-        if var_name in ('rpy_err_mag', 'pos_err_z_abs'):
-            return random.uniform(0.1, 1.5)
-        # 积分项容易累积，阈值适度收紧
-        if var_name in ('err_i_z','err_i_x','err_i_y'):
-            return random.uniform(0.2, 2.0)
-        # 默认：略收窄噪声范围
-        import math
-        base = random.choice(self.dsl_constants)
-        return float(base * random.uniform(0.5, 1.2))
 
     def _estimate_narrowness(self, program: list) -> float:
         """对条件“窄度”打分（0~1）：
@@ -1147,7 +1193,7 @@ class MCTS_Agent:
                         return True
                     cur = cur.child
                 return False
-            # 变量特定阈值参考（与 _enforce_narrow_condition 保持一致）
+            # 变量特定阈值参考（保留旧设定以衡量历史严格度指标）
             strict_caps = {
                 'pos_err_z': {'lt_max': 1.0, 'gt_min': 0.15},
                 'pos_err_xy': {'lt_max': 1.6, 'gt_min': 0.2},
@@ -1206,71 +1252,6 @@ class MCTS_Agent:
             return cur.value
         return None
 
-    def _enforce_narrow_condition(self, cond: ProgramNode) -> ProgramNode:
-        try:
-            if isinstance(cond, BinaryOpNode) and cond.op in ('<','>') and isinstance(cond.right, TerminalNode) and isinstance(cond.right.value,(int,float)):
-                # 若出现未允许的一元算子，转换为允许形态（优先使用 abs(base_var)）
-                def has_disallowed_unary(n: ProgramNode) -> bool:
-                    cur = n
-                    allowed = getattr(self, '_allowed_cond_unaries', set(['identity','abs']))
-                    while isinstance(cur, UnaryOpNode):
-                        if cur.op not in allowed:
-                            return True
-                        cur = cur.child
-                    return False
-                def has_trig(n: ProgramNode) -> bool:
-                    cur = n
-                    while isinstance(cur, UnaryOpNode):
-                        if cur.op in ('sin','cos'):
-                            return True
-                        cur = cur.child
-                    return False
-                var_name = self._get_base_var_name(cond.left)
-                T = float(cond.right.value)
-                # 若启用“相位窗口”，则对 trig 条件强制规范为 abs(trig(...)) < 小阈值
-                if bool(getattr(self, '_trig_as_phase_window', False)) and has_trig(cond.left):
-                    cond.left = UnaryOpNode('abs', cond.left if isinstance(cond.left, UnaryOpNode) else cond.left)
-                    cond.op = '<'
-                    T = min(max(T, 0.02), float(getattr(self, '_trig_lt_max', 0.25)))
-                if has_disallowed_unary(cond.left) and var_name is not None:
-                    # 替换为 abs(base_var) 与 '<' 比较一个紧的阈值
-                    cond.left = UnaryOpNode('abs', TerminalNode(var_name))
-                    cond.op = '<'
-                if var_name:
-                    # 放宽条件裁剪上限1.5倍，允许更宽松的条件产生差异化动作
-                    strict_caps = {
-                        'pos_err_z': {'lt_max': 1.5, 'gt_min': 0.1},  # 原1.0→1.5
-                        'pos_err_xy': {'lt_max': 2.4, 'gt_min': 0.15},  # 原1.6→2.4
-                        'ang_vel_x': {'lt_max': 3.3, 'gt_min': 0.2},  # 原2.2→3.3
-                        'ang_vel_y': {'lt_max': 3.3, 'gt_min': 0.2},
-                        'ang_vel_mag': {'lt_max': 3.75, 'gt_min': 0.25},
-                        'rpy_err_mag': {'lt_max': 2.7, 'gt_min': 0.15},
-                        'pos_err_z_abs': {'lt_max': 1.8, 'gt_min': 0.1},
-                        'err_i_z': {'lt_max': 3.0, 'gt_min': 0.15},
-                        'err_i_x': {'lt_max': 3.0, 'gt_min': 0.15},
-                        'err_i_y': {'lt_max': 3.0, 'gt_min': 0.15},
-                    }
-                    caps = {'lt_max': 2.25, 'gt_min': 0.15}  # 原1.5→2.25
-                    if isinstance(var_name, str) and var_name in strict_caps:
-                        caps = strict_caps[var_name]
-                    if cond.op == '<':
-                        T = min(T, caps['lt_max'])
-                        T = max(T, 0.02)
-                    else:  # '>'
-                        T = max(T, caps['gt_min'])
-                    # 若左侧为 abs() 且比较为 '>'，这种条件往往过宽，改为 '<' 并使用较紧阈值
-                    if isinstance(cond.left, UnaryOpNode) and cond.left.op == 'abs' and cond.op == '>':
-                        cond.op = '<'
-                        T = min(T, caps['lt_max'] * 0.7)  # 原0.6→0.7，略微放宽
-                    # trig 相位窗口再收紧一次（若已启用）
-                    if bool(getattr(self, '_trig_as_phase_window', False)) and has_trig(cond.left):
-                        cond.op = '<'
-                        T = min(T, float(getattr(self, '_trig_lt_max', 0.25)))
-                    cond.right = TerminalNode(round(T, 4))
-        except Exception:
-            return cond
-        return cond
-
     def _estimate_strictness(self, program: list) -> float:
         # 严格度沿用改进后的“窄度”打分
         return self._estimate_narrowness(program)
@@ -1287,16 +1268,17 @@ class MCTS_Agent:
         chosen = output_keys[:k]
         acts = []
         for key in chosen:
-            expr = self._generate_random_expression()
+            expr = self._generate_random_expression_for_channel(key)
             acts.append(BinaryOpNode('set', TerminalNode(key), expr))
         return acts
 
-    def _generate_random_expression(self, depth: int = 0, max_depth: int = 3) -> ProgramNode:
+    def _generate_random_expression_for_channel(self, channel: str, depth: int = 0, max_depth: int = 3) -> ProgramNode:
         import random
         # 叶子：变量或常数，并可能包一元函数
         if depth >= max_depth or random.random() < 0.35:
-            if random.random() < 0.7 and self.dsl_variables:
-                node: ProgramNode = TerminalNode(random.choice(self.dsl_variables))
+            allowed_vars = self._channel_allowed_vars(channel)
+            if random.random() < 0.7 and allowed_vars:
+                node = TerminalNode(random.choice(allowed_vars))
             else:
                 node = TerminalNode(random.choice(self.dsl_constants) if self.dsl_constants else 1.0)
             # 扩展一元算子池：包含基础一元以及参数化前缀的一元原语
@@ -1309,11 +1291,17 @@ class MCTS_Agent:
                 node = UnaryOpNode(random.choice(unary_pool), node)
             return node
         # 内部：二元组合
-        left = self._generate_random_expression(depth+1, max_depth)
-        right = self._generate_random_expression(depth+1, max_depth)
+        left = self._generate_random_expression_for_channel(channel, depth+1, max_depth)
+        right = self._generate_random_expression_for_channel(channel, depth+1, max_depth)
         bin_pool = [op for op in self.dsl_operators if op in ('+','-','*','/','max','min')]
         op = random.choice(bin_pool) if bin_pool else '*'
         return BinaryOpNode(op, left, right)
+
+    def _channel_allowed_vars(self, channel: str) -> List[str]:
+        subset = allowed_variables_for_channel(channel, self.dsl_variables)
+        if subset:
+            return subset
+        return list(self.dsl_variables)
     def _ast_to_str(self,node:ProgramNode)->str:
         if isinstance(node,BinaryOpNode): return f"({self._ast_to_str(node.left)} {node.op} {self._ast_to_str(node.right)})"
         if isinstance(node,UnaryOpNode): return f"{node.op}({self._ast_to_str(node.child)})"

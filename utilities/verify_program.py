@@ -58,6 +58,24 @@ def _load_pilight_controller():
     for base, name in ((_PI_FLIGHT_DIR, 'piflight_verify'), (_PI_LIGHT_DIR, 'pilight_verify')):
         init_file = os.path.join(base, '__init__.py')
         if os.path.isfile(init_file):
+            # 注册父包和子包占位符到 sys.modules，确保相对导入能找到
+            if name not in sys.modules:
+                parent = importlib.util.module_from_spec(
+                    importlib.util.spec_from_loader(name, loader=None))  # type: ignore
+                parent.__path__ = [base]  # type: ignore[attr-defined]
+                sys.modules[name] = parent
+            
+            # 注册常见子包（utils, core, envs等）占位，避免相对导入失败
+            for sub in ['utils', 'core', 'envs', 'mcts_training', 'nn_training']:
+                sub_path = os.path.join(base, sub)
+                if os.path.isdir(sub_path):
+                    sub_name = f'{name}.{sub}'
+                    if sub_name not in sys.modules:
+                        sub_mod = importlib.util.module_from_spec(
+                            importlib.util.spec_from_loader(sub_name, loader=None))  # type: ignore
+                        sub_mod.__path__ = [sub_path]  # type: ignore[attr-defined]
+                        sys.modules[sub_name] = sub_mod
+            
             spec = importlib.util.spec_from_file_location(name, init_file, submodule_search_locations=[base])
             if spec and spec.loader:
                 mod = importlib.util.module_from_spec(spec)
@@ -158,8 +176,9 @@ def parse_args():
     ap.add_argument('--inplace', action='store_true', help='写回 verified_score 与 verified_settings 到 program JSON')
     return ap.parse_args()
 
-def main():
-    args = parse_args()
+def main(args=None):
+    if args is None:
+        args = parse_args()
     # Print profile for visibility
     print(describe_profile(args.reward_profile))
     weights, ks = get_reward_profile(args.reward_profile)

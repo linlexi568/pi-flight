@@ -108,24 +108,17 @@ class MathProgramController:
                        target_vel: np.ndarray = np.zeros(3),
                        target_rpy_rates: np.ndarray = np.zeros(3)) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         state, pos_e, rpy_e = self._state_from_inputs(control_timestep, cur_pos, cur_quat, cur_vel, cur_ang_vel, target_pos, target_rpy)
-        # 输出累加（允许多条规则覆盖同一键，采用“最后命中”覆盖语义）
+        # 输出累加（直接忽略条件，所有 action 按顺序应用，后写覆盖前写）
         u_out: Dict[str, float] = {}
         for rule in (self.program or []):
-            try:
-                cond = rule.get('condition')
-                if cond is None:
-                    continue
-                cval = self._eval_ast(cond, state)
-                if cval > 0.0:
-                    acts = rule.get('action', []) or []
-                    for act in acts:
-                        if isinstance(act, BinaryOpNode) and act.op == 'set' and isinstance(act.left, TerminalNode):
-                            k = str(act.left.value)
-                            v = self._eval_ast(act.right, state) if hasattr(act, 'right') else 0.0
-                            u_out[k] = float(v)
-                    # first-match 语义：命中一条规则后可直接退出；若需要“合成”，可删掉 break
-                    break
-            except Exception:
-                continue
+            acts = rule.get('action', []) or []
+            for act in acts:
+                if isinstance(act, BinaryOpNode) and act.op == 'set' and isinstance(act.left, TerminalNode):
+                    try:
+                        k = str(act.left.value)
+                        v = self._eval_ast(act.right, state) if hasattr(act, 'right') else 0.0
+                        u_out[k] = float(v)
+                    except Exception:
+                        continue
         rpm = self._mix_to_motors(u_out)
         return rpm, pos_e, rpy_e

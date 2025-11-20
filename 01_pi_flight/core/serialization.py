@@ -15,6 +15,21 @@ from .dsl import (
     IfNode,
 )
 
+def _is_trivial_condition(node: ProgramNode | None) -> bool:
+    if node is None:
+        return True
+    if isinstance(node, TerminalNode):
+        val = node.value
+        if isinstance(val, (int, float)):
+            try:
+                return float(val) == 1.0
+            except Exception:
+                return False
+    return False
+
+def _always_true_condition() -> TerminalNode:
+    return TerminalNode(1.0)
+
 ASTDict = Dict[str, Any]
 
 def serialize_ast(node: ProgramNode) -> ASTDict:
@@ -43,20 +58,24 @@ def deserialize_ast(obj: ASTDict) -> ProgramNode:
 def serialize_program(rules: List[Dict[str, Any]]) -> Dict[str, Any]:
     serial_rules: List[Dict[str, Any]] = []
     for r in rules:
-        condition = r.get('condition')
-        if condition is None:
-            continue
         action_list = r.get('action', [])
-        serial_rules.append({
-            'condition': serialize_ast(condition),
+        cond_payload = r.get('condition')
+        entry = {
             'action': [serialize_ast(a) for a in action_list]
-        })
+        }
+        if not _is_trivial_condition(cond_payload):
+            entry['condition'] = serialize_ast(cond_payload)
+        serial_rules.append(entry)
     return {"rules": serial_rules}
 
 def deserialize_program(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
     rules_out: List[Dict[str, Any]] = []
     for r in obj.get('rules', []):
-        cond_ast = deserialize_ast(r['condition'])
+        cond_ast = None
+        if 'condition' in r:
+            cond_ast = deserialize_ast(r['condition'])
+        if _is_trivial_condition(cond_ast):
+            cond_ast = _always_true_condition()
         action_asts = [deserialize_ast(a) for a in r.get('action', [])]
         rules_out.append({'condition': cond_ast, 'action': action_asts})
     return rules_out

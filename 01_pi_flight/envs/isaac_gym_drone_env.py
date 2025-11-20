@@ -35,7 +35,8 @@ except Exception:
     pass
 
 try:
-    from isaacgym import gymapi, gymtorch, gymutil
+    # 先导入gymapi（核心Isaac Gym），但不导入gymtorch
+    from isaacgym import gymapi, gymutil
     ISAAC_GYM_AVAILABLE = True
 except Exception as _ig_e:  # 捕获并打印真实原因
     ISAAC_GYM_AVAILABLE = False
@@ -44,6 +45,14 @@ except Exception as _ig_e:  # 捕获并打印真实原因
 
 # 避免在 Isaac Gym 之前导入 torch（官方要求）；到此处再导入 torch
 import torch
+
+# ⚠️ CRITICAL: gymtorch必须在torch之后导入（它是torch的C++扩展）
+try:
+    from isaacgym import gymtorch
+except Exception as e:
+    if ISAAC_GYM_AVAILABLE:
+        print(f"[WARNING] gymtorch导入失败: {e}")
+        ISAAC_GYM_AVAILABLE = False
 
 
 class IsaacGymDroneEnv:

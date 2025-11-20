@@ -9,10 +9,10 @@ import symbols from both legacy flat layout and the new split layout:
   - nn:     (not exported here; training utilities live under .nn_training)
   - cma-es: (not exported here; tooling can live under .cma_training)
 """
-from .dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+from .core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 
-# Stable import for segmented controller
-from .segmented_controller import PiLightSegmentedPIDController
+# Stable import for segmented controller (now in utils/)
+from .utils.segmented_controller import PiLightSegmentedPIDController
 
 # 为了兼容 Python 3.8（避免在导入时触发不兼容的类型注解），延迟导入 MCTS_Agent。
 def _load_mcts_agent():

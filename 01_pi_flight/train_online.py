@@ -77,31 +77,35 @@ except Exception as e:
     BATCH_EVAL_AVAILABLE = False
     BatchEvaluator = None  # type: ignore
 
+try:
+    from utils.prior_scoring import PRIOR_PROFILES
+except Exception:
+    PRIOR_PROFILES = {"none": (0.0, 0.0)}
+
+try:
+    from utils.program_constraints import validate_program, HARD_CONSTRAINT_PENALTY
+except Exception:
+    try:
+        from program_constraints import validate_program, HARD_CONSTRAINT_PENALTY  # type: ignore
+    except Exception:
+        def validate_program(_program):  # type: ignore
+            return True, ""
+        HARD_CONSTRAINT_PENALTY = -1e6  # type: ignore
+
 # 现在再导入 torch 及其子模块，避免破坏 isaacgym 的导入顺序要求
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-# 无Isaac Gym时的简易占位Evaluator（仅用于开发/单元测试，不代表真实性能）
-class _DummyEvaluator:
-    def __init__(self, *args, **kwargs) -> None:
-        self._rng = random.Random(0)
-    def evaluate_single(self, program: List[Dict[str, Any]]) -> float:
-        # 粗略按规则数给一点偏好，仍保留随机性，便于跑通流程
-        base = float(len(program)) * 0.05
-        return base + (self._rng.random() - 0.5) * 0.1
-    def evaluate_batch(self, programs: List[List[Dict[str, Any]]]):
-        return [self.evaluate_single(p) for p in programs]
-
 # 导入serialization
 try:
     from core.serialization import save_program_json as _save_prog
-    def save_program_json(program, path):  # type: ignore
-        _save_prog(program, path)
+    def save_program_json(program, path, meta=None):  # type: ignore
+        _save_prog(program, path, meta=meta)
 except Exception:
-    def save_program_json(program, path):  # type: ignore
-        import json
+    def save_program_json(program, path, meta=None):  # type: ignore
+        import json, os, time
         # 简化版保存（不包含节点对象）
         simplified = []
         for rule in program:
@@ -111,11 +115,38 @@ except Exception:
             }
             simplified.append(simple_rule)
         
+        payload = {'rules': simplified, 'note': 'Simplified format'}
+        if meta:
+            payload['meta'] = meta
+        payload.setdefault('meta', {})['saved_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w') as f:
-            json.dump({'rules': simplified, 'note': 'Simplified format'}, f, indent=2)
+            json.dump(payload, f, indent=2)
 
 
-def get_program_hash(program):
+def _normalize_constants_for_hash(obj):
+    """递归替换所有浮点常数为占位符，用于结构哈希
+    
+    目的：让结构相同但参数不同的程序共享同一个GNN缓存
+    """
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            if k == 'value' and isinstance(v, (int, float)):
+                # 常数值统一替换为占位符
+                result[k] = '<CONST>'
+            else:
+                result[k] = _normalize_constants_for_hash(v)
+        return result
+    elif isinstance(obj, list):
+        return [_normalize_constants_for_hash(item) for item in obj]
+    elif isinstance(obj, (int, float)):
+        return '<CONST>'
+    else:
+        return obj
+
+
+def get_program_hash(program, ignore_constants=True):
     """生成程序的稳定哈希值用于缓存。
     
     使用AST序列化后的JSON（排序键）计算blake2s，避免内存地址导致的伪差异，
@@ -123,6 +154,8 @@ def get_program_hash(program):
     
     Args:
         program: 程序表示（可以是DSL程序、AST等）
+        ignore_constants: 是否忽略常数值（仅保留结构），默认True
+                         True时，所有常数值替换为'<CONST>'，大幅提高BO场景下的缓存命中率
         
     Returns:
         str: 程序的哈希值（16进制字符串）
@@ -131,6 +164,11 @@ def get_program_hash(program):
         import json, hashlib
         from core.serialization import to_serializable_dict
         serial = to_serializable_dict(program)  # {'rules': ...}
+        
+        # 🚀 关键优化：忽略常数值，只基于结构哈希
+        if ignore_constants:
+            serial = _normalize_constants_for_hash(serial)
+        
         s = json.dumps(serial, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         return hashlib.blake2s(s.encode('utf-8')).hexdigest()
     except Exception:
@@ -181,16 +219,26 @@ class OnlineTrainer:
         self.use_gnn = True
         
         # 初始化NN（GNN统一使用v2分层架构）
-        print(f"[Trainer] 使用 GNN v2 (Hierarchical Dual) 分层网络 (固定特征网络已删除)")
+        gnn_structure_hidden = getattr(args, 'gnn_structure_hidden', 256)
+        gnn_structure_layers = getattr(args, 'gnn_structure_layers', 5)
+        gnn_structure_heads = getattr(args, 'gnn_structure_heads', 8)
+        gnn_feature_layers = getattr(args, 'gnn_feature_layers', 3)
+        gnn_feature_heads = getattr(args, 'gnn_feature_heads', 8)
+        gnn_dropout = getattr(args, 'gnn_dropout', 0.1)
+        
+        print(f"[Trainer] 使用 GNN v2 (Hierarchical Dual) 分层网络")
+        print(f"[Trainer] GNN架构: structure({gnn_structure_hidden}d×{gnn_structure_layers}L×{gnn_structure_heads}H), "
+              f"feature({gnn_feature_layers}L×{gnn_feature_heads}H), dropout={gnn_dropout}")
+        
         self.nn_model = create_gnn_policy_value_net_v2(
             node_feature_dim=24,
             policy_output_dim=len(EDIT_TYPES),
-            structure_hidden=256,
-            structure_layers=5,
-            structure_heads=8,
-            feature_layers=3,
-            feature_heads=8,
-            dropout=0.1
+            structure_hidden=gnn_structure_hidden,
+            structure_layers=gnn_structure_layers,
+            structure_heads=gnn_structure_heads,
+            feature_layers=gnn_feature_layers,
+            feature_heads=gnn_feature_heads,
+            dropout=gnn_dropout
         ).to(self.device)
         
         # 禁用torch compile避免Python 3.13兼容性问题
@@ -222,34 +270,53 @@ class OnlineTrainer:
         
         # 经验回放
         self.replay_buffer = ReplayBuffer(capacity=args.replay_capacity, use_gnn=self.use_gnn)
+
+        # 先验配置（结构/稳定性）
+        prior_profile_key = getattr(args, 'prior_profile', 'none')
+        preset_structure, preset_stability = PRIOR_PROFILES.get(prior_profile_key, PRIOR_PROFILES.get('none', (0.0, 0.0)))
+        structure_override = getattr(args, 'structure_prior_weight', None)
+        stability_override = getattr(args, 'stability_prior_weight', None)
+        self.structure_prior_weight = float(preset_structure if structure_override is None else structure_override)
+        self.stability_prior_weight = float(preset_stability if stability_override is None else stability_override)
+        print(f"[Trainer] 先验配置: profile={prior_profile_key} => structure={self.structure_prior_weight:.3f}, stability={self.stability_prior_weight:.3f}")
         
-        # 评估器：支持强制使用 Dummy，用于快速A/B基准
-        force_dummy = getattr(args, 'use_dummy_eval', False)
         # 调试：逐步奖励与零动作统计
         if getattr(args, 'debug_rewards', False):
             os.environ['DEBUG_STEPWISE'] = '1'
-        if force_dummy or BatchEvaluator is None:
-            if not force_dummy:
-                print("[Trainer] 使用 DummyEvaluator（未检测到 Isaac Gym）")
-            else:
-                print("[Trainer] 强制使用 DummyEvaluator（A/B快速基准）")
-            self.evaluator = _DummyEvaluator()
-        else:
-            self.evaluator = BatchEvaluator(
-                trajectory_config=self._build_trajectory(),
-                duration=args.duration,
-                isaac_num_envs=args.isaac_num_envs,
-                device=str(self.device),
-                replicas_per_program=getattr(args, 'eval_replicas_per_program', 1),
-                min_steps_frac=getattr(args, 'min_steps_frac', 0.0),
-                reward_reduction=getattr(args, 'reward_reduction', 'sum'),
-                reward_profile=getattr(args, 'reward_profile', 'control_law_discovery'),  # 🔥 支持奖励配置文件切换
-                strict_no_prior=True,  # 统一使用直接u_*控制（不依赖内置PID框架）
-                zero_action_penalty=float(getattr(args, 'zero_action_penalty', 0.0)),  # 参数化零动作惩罚
-                complexity_bonus=0.0,  # AlphaZero哲学：让NN自己学习复杂度权衡
-                use_fast_path=getattr(args, 'use_fast_path', False),
-                action_scale_multiplier=float(getattr(args, 'action_scale_multiplier', 1.0))  # 动作缩放系数
-            )
+        if not BATCH_EVAL_AVAILABLE:
+            raise RuntimeError("BatchEvaluator 不可用：请确保 Isaac Gym 及相关依赖已正确安装。项目已移除 DummyEvaluator 回退，所有训练必须使用真实奖励。")
+
+        print("[Trainer] 使用 BatchEvaluator（真实 Isaac Gym 奖励）")
+        self.evaluator = BatchEvaluator(
+            trajectory_config=self._build_trajectory(),
+            duration=args.duration,
+            isaac_num_envs=args.isaac_num_envs,
+            device=str(self.device),
+            replicas_per_program=getattr(args, 'eval_replicas_per_program', 1),
+            min_steps_frac=getattr(args, 'min_steps_frac', 0.0),
+            reward_reduction=getattr(args, 'reward_reduction', 'sum'),
+            reward_profile=getattr(args, 'reward_profile', 'control_law_discovery'),  # 🔥 支持奖励配置文件切换
+            strict_no_prior=True,  # 统一使用直接u_*控制（不依赖内置PID框架）
+            zero_action_penalty=float(getattr(args, 'zero_action_penalty', 0.0)),  # 参数化零动作惩罚
+            complexity_bonus=0.0,  # AlphaZero哲学：让NN自己学习复杂度权衡
+            use_fast_path=getattr(args, 'use_fast_path', False),
+            use_gpu_expression_executor=not getattr(args, 'disable_gpu_expression', False),
+            action_scale_multiplier=float(getattr(args, 'action_scale_multiplier', 1.0)),  # 动作缩放系数
+            structure_prior_weight=self.structure_prior_weight,
+            stability_prior_weight=self.stability_prior_weight,
+            enable_output_mad=getattr(args, 'enable_output_mad', True),
+            mad_min_fz=float(getattr(args, 'mad_min_fz', 0.0)),
+            mad_max_fz=float(getattr(args, 'mad_max_fz', 7.5)),
+            mad_max_xy=float(getattr(args, 'mad_max_xy', 0.12)),
+            mad_max_yaw=float(getattr(args, 'mad_max_yaw', 0.04)),
+            mad_max_delta_fz=float(getattr(args, 'mad_max_delta_fz', 1.5)),
+            mad_max_delta_xy=float(getattr(args, 'mad_max_delta_xy', 0.03)),
+            mad_max_delta_yaw=float(getattr(args, 'mad_max_delta_yaw', 0.02)),
+            enable_bayesian_tuning=getattr(args, 'enable_bayesian_tuning', False),
+            bo_batch_size=getattr(args, 'bo_batch_size', 50),
+            bo_iterations=getattr(args, 'bo_iterations', 3),
+            bo_param_ranges={'default': (getattr(args, 'bo_param_range_min', -3.0), getattr(args, 'bo_param_range_max', 3.0))}
+        )
         
         # 统计
         self.iteration = 0
@@ -259,7 +326,25 @@ class OnlineTrainer:
         self.training_stats = []
         self._mcts_stats = {}  # MCTS性能统计
         
-        # 🏆 精英程序池 (Elite Archive) - 保留Top-K最优程序
+        # 🔄 异步训练支持
+        self.async_training = getattr(args, 'async_training', False)
+        self.async_trainer = None  # 稍后初始化
+        
+        # � 三合一优化开关
+        self.enable_ranking_mcts_bias = getattr(args, 'enable_ranking_mcts_bias', True)
+        self.ranking_bias_beta = getattr(args, 'ranking_bias_beta', 0.3)
+        self.enable_value_head = getattr(args, 'enable_value_head', True)
+        self.enable_ranking_reweight = getattr(args, 'enable_ranking_reweight', True)
+        self.ranking_reweight_beta = getattr(args, 'ranking_reweight_beta', 0.2)
+        
+        if self.enable_ranking_mcts_bias:
+            print(f"[Trainer] ✅ Ranking→MCTS偏置已启用 (beta={self.ranking_bias_beta})")
+        if self.enable_value_head:
+            print(f"[Trainer] ✅ Value头辅助训练已启用（纯训练信号，MCTS仍用真实仿真）")
+        if self.enable_ranking_reweight:
+            print(f"[Trainer] ✅ Ranking→Policy重加权已启用 (beta={self.ranking_reweight_beta})")
+        
+        # �🏆 精英程序池 (Elite Archive) - 保留Top-K最优程序
         self.elite_archive = []  # [(reward, program_copy, iter_idx), ...]
         self.elite_archive_size = getattr(args, 'elite_archive_size', 100)  
         print(f"[Trainer] 🏆 精英程序池: 保留Top-{self.elite_archive_size}最优程序")
@@ -271,14 +356,40 @@ class OnlineTrainer:
         self._max_depth = 12
         # 注意：已移除value head，全部使用真实仿真
         # Dirichlet / 温度探索参数（内部固定 + 退火日程）
-        # 根噪声退火：前期更强探索，后期降低噪声以提高复用/召回
-        self._root_dirichlet_eps_init = 0.60
-        self._root_dirichlet_eps_final = 0.15
-        self._root_dirichlet_alpha_init = 0.50
-        self._root_dirichlet_alpha_final = 0.30
-        self._root_dirichlet_decay_iters = 600
-        self._root_dirichlet_eps = self._root_dirichlet_eps_init
-        self._root_dirichlet_alpha = self._root_dirichlet_alpha_init
+        # 🔥 Meta-RL 或启发式衰减参数配置
+        self.use_meta_rl = getattr(args, 'use_meta_rl', False)
+        self.meta_rl_controller = None
+        
+        if self.use_meta_rl:
+            # 加载 Meta-RL RNN 控制器
+            from meta_rl.controller import MetaRLController
+            meta_ckpt = getattr(args, 'meta_rl_checkpoint', 'meta_rl/checkpoints/meta_policy.pt')
+            print(f"[Trainer] 🧠 启用 Meta-RL 动态调参 (模型: {meta_ckpt})")
+            self.meta_rl_controller = MetaRLController(checkpoint_path=meta_ckpt, device=self.device)
+            # Meta-RL 模式下初始值由控制器决定
+            self._root_dirichlet_eps = 0.25
+            self._root_dirichlet_alpha = 0.30
+        else:
+            # 启发式衰减模式：支持命令行参数覆盖
+            if getattr(args, 'root_dirichlet_eps_init', None) is not None:
+                # 用户指定了启发式参数
+                self._root_dirichlet_eps_init = float(args.root_dirichlet_eps_init)
+                self._root_dirichlet_eps_final = float(getattr(args, 'root_dirichlet_eps_final', self._root_dirichlet_eps_init))
+                self._root_dirichlet_alpha_init = float(getattr(args, 'root_dirichlet_alpha_init', args.root_dirichlet_alpha))
+                self._root_dirichlet_alpha_final = float(getattr(args, 'root_dirichlet_alpha_final', self._root_dirichlet_alpha_init))
+                self._root_dirichlet_decay_iters = int(getattr(args, 'heuristic_decay_window', 200))
+                print(f"[Trainer] 📉 启发式退火: eps={self._root_dirichlet_eps_init:.2f}→{self._root_dirichlet_eps_final:.2f}, alpha={self._root_dirichlet_alpha_init:.2f}→{self._root_dirichlet_alpha_final:.2f} (窗口={self._root_dirichlet_decay_iters})")
+            else:
+                # 使用内部默认值
+                self._root_dirichlet_eps_init = 0.60
+                self._root_dirichlet_eps_final = 0.15
+                self._root_dirichlet_alpha_init = 0.50
+                self._root_dirichlet_alpha_final = 0.30
+                self._root_dirichlet_decay_iters = 600
+                print(f"[Trainer] 📉 默认退火日程: eps={self._root_dirichlet_eps_init:.2f}→{self._root_dirichlet_eps_final:.2f}, alpha={self._root_dirichlet_alpha_init:.2f}→{self._root_dirichlet_alpha_final:.2f}")
+            
+            self._root_dirichlet_eps = self._root_dirichlet_eps_init
+            self._root_dirichlet_alpha = self._root_dirichlet_alpha_init
         # 温度退火日程：从高温（探索）逐步降至低温（利用）
         self._policy_temperature_init = 2.0  # 🔧 提高初始温度：1.5→2.0 - 更强探索
         self._policy_temperature_final = 0.8  # 🔧 提高最终温度：0.5→0.8 - 保持探索性
@@ -312,7 +423,7 @@ class OnlineTrainer:
                 gnn_model=self.nn_model,  # 传递GNN模型
                 device=self.device,
                 learning_rate=getattr(args, 'ranking_lr', 1e-3),
-                embed_dim=256  # GNN v2 hidden size
+                embed_dim=gnn_structure_hidden  # 使用 GNN 的实际 hidden size
             )
             # 混合系数：逐步从MCTS value过渡到ranking value
             self.ranking_blend_factor = float(getattr(args, 'ranking_blend_init', 0.3))
@@ -376,7 +487,9 @@ class OnlineTrainer:
             evaluation_function=lambda p: 0.0,  # 占位符
             dsl_variables=['pos_err', 'vel_err'],
             dsl_constants=[0.0, 1.0],
-            dsl_operators=['+', '-', '*']
+            dsl_operators=['+', '-', '*'],
+            structure_prior_weight=self.structure_prior_weight,
+            stability_prior_weight=self.stability_prior_weight
         )
         return mcts._generate_random_segmented_program()
     
@@ -554,6 +667,32 @@ class OnlineTrainer:
                 f.write(json.dumps(rec, ensure_ascii=False) + '\n')
         except Exception as e:
             print(f"[History] 追加程序记录失败: {e}")
+    
+    def _get_saved_program_reward(self, save_path: str) -> float:
+        """
+        读取已保存程序文件中的奖励值
+        
+        Returns:
+            已保存程序的奖励值，如果文件不存在或读取失败则返回负无穷
+        """
+        if not os.path.exists(save_path):
+            return float('-inf')  # 文件不存在，任何新程序都应该保存
+        
+        try:
+            import json
+            with open(save_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # 尝试从meta中读取reward
+            if 'meta' in data and 'reward' in data['meta']:
+                saved_reward = float(data['meta']['reward'])
+                return saved_reward
+            else:
+                # 旧版本文件可能没有meta，返回负无穷以允许保存
+                return float('-inf')
+        except Exception as e:
+            print(f"  ⚠️  读取已保存程序奖励失败: {e}，将允许保存")
+            return float('-inf')  # 读取失败，允许保存以防万一
 
     def mcts_search(self, root_program: List[Dict[str, Any]], num_simulations: int = 800, iter_idx: int = 0) -> Tuple[List[Any], List[int]]:
         """
@@ -652,8 +791,20 @@ class OnlineTrainer:
             dsl_constants=[0.0, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0],  # 扩大常数范围以产生更大动作幅度
             dsl_operators=dsl_operators,
             exploration_weight=self._exploration_weight,
-            max_depth=self._max_depth
+            max_depth=self._max_depth,
+            structure_prior_weight=self.structure_prior_weight,
+            stability_prior_weight=self.stability_prior_weight
         )
+        
+        # 🌟 设置 ranking 网络用于 MCTS bias（条件启用）
+        if self.enable_ranking_mcts_bias and self.use_ranking and hasattr(self, 'ranking_net') and self.ranking_net is not None:
+            mcts.ranking_net = self.ranking_net
+            mcts.gnn_encoder = self.nn_model
+            mcts.ranking_bias_beta = self.ranking_bias_beta
+            mcts.ranking_device = self.device
+        else:
+            # 确保关闭时 ranking_net 为 None
+            mcts.ranking_net = None
         
         # 设置root（AST 内部表示）
         root_ast = to_ast_program(root_program)
@@ -917,9 +1068,30 @@ class OnlineTrainer:
         all_leaves = pending_evals  # 直接使用，不需要解包第三个参数
         
         if all_leaves:
-            programs = [leaf.program for leaf, _ in all_leaves]
-            rewards = self.evaluator.evaluate_batch(programs)
-            for (leaf, path), reward in zip(all_leaves, rewards):
+            invalid_reasons = {}
+            valid_programs: List[List[Dict[str, Any]]] = []
+            valid_refs: List[Tuple[MCTSNode, List[MCTSNode]]] = []
+            for idx, (leaf, path) in enumerate(all_leaves):
+                program = leaf.program
+                ok, reason = validate_program(program)
+                if ok:
+                    valid_programs.append(program)
+                    valid_refs.append((leaf, path))
+                else:
+                    invalid_reasons[idx] = reason or "violates hard constraint"
+
+            rewards_valid: List[float] = []
+            if valid_programs:
+                rewards_valid = self.evaluator.evaluate_batch(valid_programs)
+
+            valid_iter = iter(rewards_valid)
+            for idx, (leaf, path) in enumerate(all_leaves):
+                if idx in invalid_reasons:
+                    reason = invalid_reasons[idx]
+                    print(f"[HardConstraint] Reject program before sim: {reason}")
+                    reward = float(HARD_CONSTRAINT_PENALTY)
+                else:
+                    reward = float(next(valid_iter))
                 for node in reversed(path):
                     # visits已在模拟循环内更新, 这里只更新value_sum
                     node.value_sum += reward
@@ -1003,10 +1175,10 @@ class OnlineTrainer:
         return best_child if best_child else node.children[0]
     
     def train_step(self):
-        """单步训练"""
-        # 至少需要8个样本才能训练（避免batch太小）
-        if len(self.replay_buffer) < 8:
-            return
+        """单步训练（AlphaZero风格：从第一个样本就开始学习）"""
+        # 空buffer无法训练
+        if len(self.replay_buffer) == 0:
+            return None
         
         # 采样batch（使用实际buffer大小和batch_size的较小值）
         actual_batch_size = min(self.args.batch_size, len(self.replay_buffer))
@@ -1018,8 +1190,8 @@ class OnlineTrainer:
         batch_graph = PyGBatch.from_data_list(graph_list).to(self.device)
         policy_targets = torch.stack([s['policy_target'] for s in batch]).to(self.device)
         
-        # 前向传播：仅使用policy头
-        policy_logits, _, _ = self.nn_model(batch_graph)  # 忽略value输出
+        # 前向传播：根据配置决定是否使用value头
+        policy_logits, value_scalar, value_components = self.nn_model(batch_graph)
         
         # ===== 诊断：策略目标的质量与分布 =====
         with torch.no_grad():
@@ -1047,8 +1219,20 @@ class OnlineTrainer:
         policy_entropy = (-(policy_probs.clamp(min=1e-12) * policy_probs.clamp(min=1e-12).log()).sum(dim=-1)).mean()
         _ENTROPY_COEFF = 0.01  # 固定系数，NN内部正则，不暴露为外参
         
-        # 总损失（仅策略 + 熵正则）
+        # Value head 损失（条件启用）
+        value_loss = torch.tensor(0.0, device=self.device)
+        if self.enable_value_head:
+            # 提取真实奖励作为value target
+            reward_targets = torch.tensor([s['reward_true'] for s in batch], device=self.device, dtype=torch.float32)
+            # 归一化到[-1, 1]（假设奖励范围在[-10, 0]之间）
+            reward_targets_norm = torch.tanh(reward_targets / 5.0)
+            # MSE loss for value scalar
+            value_loss = F.mse_loss(value_scalar, reward_targets_norm)
+        
+        # 总损失（策略 + 熵正则 + value）
         total_loss = policy_loss - _ENTROPY_COEFF * policy_entropy
+        if self.enable_value_head:
+            total_loss = total_loss + value_loss
         
         # 🔧 显存优化：反向传播前清理CUDA缓存
         if torch.cuda.is_available():
@@ -1074,6 +1258,7 @@ class OnlineTrainer:
 
         return {
             'policy_loss': policy_loss.item(),
+            'value_loss': value_loss.item() if self.enable_value_head else 0.0,
             'total_loss': total_loss.item(),
             'grad_norm': float(getattr(grad_norm, 'item', lambda: grad_norm)() if hasattr(grad_norm, 'item') else float(grad_norm)),
             'param_delta': float(delta),
@@ -1101,6 +1286,7 @@ class OnlineTrainer:
         print(f"MCTS模拟数/迭代: {self.args.mcts_simulations}")
         print(f"NN更新频率: 每{self.args.update_freq}次迭代")
         print(f"批量大小: {self.args.batch_size}")
+        print(f"🚀 GNN结构缓存: 已启用（忽略常数值，BO调参时复用结构先验）")
         
         # 零动作惩罚课程化配置
         zero_action_penalty_init = float(getattr(self.args, 'zero_action_penalty', 0.0))
@@ -1124,7 +1310,27 @@ class OnlineTrainer:
         else:
             current_program = self._generate_random_program()
         
+        # 🔄 初始化异步训练器（如果启用）
+        if self.async_training:
+            from utils.async_trainer import create_trainer
+            print(f"[Trainer] 🔄 启用异步训练模式（MCTS与NN并行）")
+            self.async_trainer = create_trainer(
+                train_fn=lambda: self.train_step(),
+                async_mode=True,
+                update_interval=getattr(self.args, 'async_update_interval', 0.1),
+                max_steps_per_iter=getattr(self.args, 'async_max_steps_per_iter', None)
+            )
+            self.async_trainer.start()
+        else:
+            from utils.async_trainer import create_trainer
+            self.async_trainer = create_trainer(
+                train_fn=lambda: self.train_step(),
+                async_mode=False
+            )
+        
         for iter_idx in range(self.args.total_iters):
+            if self.async_training and self.async_trainer is not None:
+                self.async_trainer.reset_iter()
             iter_start_time = time.time()
             
             # �️ 温度退火：逐步从探索转向利用
@@ -1136,16 +1342,33 @@ class OnlineTrainer:
                     print(f"[温度退火] T={self._policy_temperature:.3f}")
             else:
                 self._policy_temperature = self._policy_temperature_final
-            # 🌪️ 根 Dirichlet 噪声退火：降低后期噪声以提升 prior 复用/召回
-            if iter_idx < self._root_dirichlet_decay_iters:
-                p = iter_idx / max(1, self._root_dirichlet_decay_iters)
-                self._root_dirichlet_eps = self._root_dirichlet_eps_init + (self._root_dirichlet_eps_final - self._root_dirichlet_eps_init) * p
-                self._root_dirichlet_alpha = self._root_dirichlet_alpha_init + (self._root_dirichlet_alpha_final - self._root_dirichlet_alpha_init) * p
-                if (iter_idx + 1) % 100 == 0:
-                    print(f"[Dirichlet退火] eps={self._root_dirichlet_eps:.2f}, alpha={self._root_dirichlet_alpha:.2f}")
+            # 🌪️ 根 Dirichlet 噪声调整：Meta-RL 动态控制 或 启发式退火
+            if self.use_meta_rl and self.meta_rl_controller is not None:
+                # Meta-RL 模式：根据训练指标动态调整超参数
+                if iter_idx > 0:  # 跳过第一轮（没有历史数据）
+                    try:
+                        hyperparams = self.meta_rl_controller.predict(
+                            reward_history=[s['reward'] for s in self.training_stats[-20:]],  # 最近20轮奖励
+                            best_reward=self.best_reward,
+                            current_iter=iter_idx
+                        )
+                        self._root_dirichlet_eps = hyperparams['root_dirichlet_eps']
+                        self._root_dirichlet_alpha = hyperparams['root_dirichlet_alpha']
+                        if (iter_idx + 1) % 50 == 0:
+                            print(f"[Meta-RL] eps={self._root_dirichlet_eps:.3f}, alpha={self._root_dirichlet_alpha:.3f}")
+                    except Exception as e:
+                        print(f"[Meta-RL] 预测失败，使用默认值: {e}")
             else:
-                self._root_dirichlet_eps = self._root_dirichlet_eps_final
-                self._root_dirichlet_alpha = self._root_dirichlet_alpha_final
+                # 启发式退火模式
+                if iter_idx < self._root_dirichlet_decay_iters:
+                    p = iter_idx / max(1, self._root_dirichlet_decay_iters)
+                    self._root_dirichlet_eps = self._root_dirichlet_eps_init + (self._root_dirichlet_eps_final - self._root_dirichlet_eps_init) * p
+                    self._root_dirichlet_alpha = self._root_dirichlet_alpha_init + (self._root_dirichlet_alpha_final - self._root_dirichlet_alpha_init) * p
+                    if (iter_idx + 1) % 100 == 0:
+                        print(f"[Dirichlet退火] eps={self._root_dirichlet_eps:.2f}, alpha={self._root_dirichlet_alpha:.2f}")
+                else:
+                    self._root_dirichlet_eps = self._root_dirichlet_eps_final
+                    self._root_dirichlet_alpha = self._root_dirichlet_alpha_final
             
             # �🎓 零动作惩罚课程化：每轮衰减
             if iter_idx > 0 and zero_action_penalty_decay < 1.0 and current_zero_penalty > zero_action_penalty_min:
@@ -1157,7 +1380,13 @@ class OnlineTrainer:
                     print(f"[Curriculum] 零动作惩罚衰减至: {current_zero_penalty:.3f}")
             
             penalty_info = f" | ZeroPenalty={current_zero_penalty:.2f}" if current_zero_penalty > 0 else ""
-            print(f"\n[Iter {iter_idx+1}/{self.args.total_iters}] MCTS搜索中...{penalty_info}")
+            
+            # ⭐ 简化输出模式：仅每 N 轮打印一次详细信息（默认每10轮）
+            verbose_interval = int(os.environ.get('TRAIN_VERBOSE_INTERVAL', '10'))
+            show_iter_detail = (iter_idx + 1) % verbose_interval == 0 or iter_idx == 0 or (iter_idx + 1) == self.args.total_iters
+            
+            if show_iter_detail:
+                print(f"\n[Iter {iter_idx+1}/{self.args.total_iters}] MCTS搜索中...{penalty_info}")
             
             # MCTS搜索（带精英根种子）
             seeded_program = current_program
@@ -1168,7 +1397,8 @@ class OnlineTrainer:
                         k = min(int(getattr(self, '_elite_seed_topk', 5)), len(self.elite_archive))
                         cand = self.elite_archive[:k]
                         _, seeded_program, src_iter = _r.choice(cand)
-                        print(f"[Seed] 使用精英根种子 (Top-{k} 内) | 来自迭代 {src_iter}")
+                        if show_iter_detail:
+                            print(f"[Seed] 使用精英根种子 (Top-{k} 内) | 来自迭代 {src_iter}")
             except Exception:
                 seeded_program = current_program
             children, visit_counts = self.mcts_search(seeded_program, self.args.mcts_simulations, iter_idx)
@@ -1180,7 +1410,7 @@ class OnlineTrainer:
                 torch.cuda.empty_cache()
             
             # 🌳 根节点探索多样性统计（每10轮输出）
-            if (iter_idx + 1) % 10 == 0 and children:
+            if show_iter_detail and children:
                 total_visits = sum(visit_counts)
                 entropy = 0.0
                 if total_visits > 0:
@@ -1190,7 +1420,8 @@ class OnlineTrainer:
                 print(f"  [根统计] 子节点数={len(children)}, 总访问={total_visits}, 熵={entropy:.3f}, Top3访问={top3_visits}")
             
             if not children:
-                print(f"[Iter {iter_idx+1}] ⚠️ 未生成子节点，跳过")
+                if show_iter_detail:
+                    print(f"[Iter {iter_idx+1}] ⚠️ 未生成子节点，跳过")
                 continue
             
             # 选择访问最多的子节点
@@ -1230,18 +1461,27 @@ class OnlineTrainer:
 
             # 真实评估（每次迭代至少1次）
             # 优先使用组件级接口获取细粒度指标
+            # 🔍 分离训练奖励和真实奖励
+            reward_train = 0.0  # 训练信号（含惩罚）→ 用于NN和best_reward比较
+            reward_true = 0.0   # 真实奖励（不含惩罚）→ 用于保存和输出
             reward_components = None
             if hasattr(self.evaluator, 'evaluate_single_with_metrics'):
                 try:
-                    reward, reward_components = self.evaluator.evaluate_single_with_metrics(next_program)
-                    # 打印组件均值用于诊断哪个分量恒定
+                    reward_train, reward_true, reward_components = self.evaluator.evaluate_single_with_metrics(next_program)
+                    # 打印组件均值用于诊断哪个分量恒定（显示真实奖励）
                     if reward_components:
                         comp_str = " | ".join([f"{k[:8]}={v:.3f}" for k, v in list(reward_components.items())[:6]])
-                        print(f"[Iter {iter_idx+1}] 组件: {comp_str}")
-                except Exception:
-                    reward = self.evaluator.evaluate_single(next_program)
+                        zero_penalty = reward_components.get('zero_action_penalty', 0.0)
+                        penalty_info = f" | 零惩罚={zero_penalty:.1f}" if zero_penalty > 0 else ""
+                        print(f"[Iter {iter_idx+1}] 组件: {comp_str}{penalty_info}")
+                        print(f"[Iter {iter_idx+1}] 奖励: 真实={reward_true:.4f}, 训练={reward_train:.4f}")
+                except Exception as e:
+                    print(f"  ⚠️  evaluate_single_with_metrics 失败: {e}")
+                    reward_train = self.evaluator.evaluate_single(next_program)
+                    reward_true = reward_train
             else:
-                reward = self.evaluator.evaluate_single(next_program)
+                reward_train = self.evaluator.evaluate_single(next_program)
+                reward_true = reward_train
             
             # 收集训练样本
             # 策略标签：将根子节点访问分布按其编辑类型聚合到 EDIT_TYPES
@@ -1292,10 +1532,11 @@ class OnlineTrainer:
             except Exception:
                 pass
             
-            # 构建样本（不再包含value_target）
+            # 构建样本（包含reward_true用于value head训练）
             sample = {
                 'graph': ast_to_pyg_graph(current_program),
-                'policy_target': policy_target
+                'policy_target': policy_target,
+                'reward_true': reward_true  # 用于训练value head
             }
             
             self.replay_buffer.push(sample)
@@ -1326,8 +1567,8 @@ class OnlineTrainer:
                                     if hasattr(action, 'right') and hasattr(action.right, 'value') and isinstance(action.right.value, (int, float)):
                                         action.right.value = round(float(action.right.value) * np.random.uniform(0.85, 1.15), 4)
                                         break
-                            # 简化评估：使用Q值估计
-                            estimated_q = reward + np.random.uniform(-2.0, 2.0)  # 添加噪声
+                            # 简化评估：使用Q值估计（基于真实奖励）
+                            estimated_q = reward_true + np.random.uniform(-2.0, 2.0)  # 添加噪声
                             augmented_programs.append((mutated_program, estimated_q))
                 else:
                     # children足够多，直接使用
@@ -1335,7 +1576,7 @@ class OnlineTrainer:
                         augmented_programs.append((child.program, getattr(child, 'value_sum', 0.0) / max(1, getattr(child, 'visits', 1))))
                 
                 # 1️⃣ 当前程序 vs augmented programs
-                current_reward = reward  # 当前根节点的真实奖励
+                current_reward = reward_true  # 当前根节点的真实奖励（用于ranking比较）
                 current_graph = ast_to_pyg_graph(current_program)
                 current_action_feat = self._quick_action_features(current_program)
                 
@@ -1386,37 +1627,53 @@ class OnlineTrainer:
             # 更新NN（每N次迭代）
             nn_loss_info = ""
             if (iter_idx + 1) % self.args.update_freq == 0:
-                print(f"[Iter {iter_idx+1}] 🔄 更新NN...")
-                total_policy_loss = 0.0
-                total_loss = 0.0
-                for step_idx in range(self.args.train_steps_per_update):
-                    losses = self.train_step()
-                    if losses:
-                        total_policy_loss += losses['policy_loss']
-                        total_loss += losses['total_loss']
-                        if step_idx == 0 or (step_idx + 1) % 10 == 0:  # 输出首次和每10步
-                            # 附带策略目标分布诊断，帮助定位 policy_loss=0 的根因
-                            diag_msg = (
-                                f"pt_sum(mean={losses['pt_sum_mean']:.3f}, min={losses['pt_sum_min']:.3f}, max={losses['pt_sum_max']:.3f}), "
-                                f"pt_nz(mean={losses['pt_nz_mean']:.1f}), "
-                                f"pt_H(mean={losses['pt_entropy_mean']:.3f}), "
-                                f"p(correct)_mean={losses['pred_correct_prob_mean']:.3f}, "
-                                f"top1_acc={losses['pred_top1_acc']:.2f}, "
-                                f"H_pred={losses.get('policy_entropy', 0.0):.3f}"
-                            )
-                            if losses.get('pt_any_zero_sum') or losses.get('pt_any_nan_sum'):
-                                diag_msg += " | ALERT: target_sum_zero_or_nan"
-                            print(
-                                f"  Step {step_idx+1}/{self.args.train_steps_per_update}: "
-                                f"policy={losses['policy_loss']:.4f}, "
-                                f"total={losses['total_loss']:.4f} | " + diag_msg
-                            )
-                # 平均loss
-                n_steps = self.args.train_steps_per_update
-                avg_policy = total_policy_loss / n_steps
-                avg_total = total_loss / n_steps
-                nn_loss_info = f" | NN Loss: {avg_total:.4f} (p={avg_policy:.4f})"
-                print(f"  ✅ 平均Loss: policy={avg_policy:.4f}, total={avg_total:.4f}")
+                if self.async_training:
+                    # 🔄 异步模式：获取后台训练的最新 metrics
+                    metrics = self.async_trainer.get_metrics()
+                    if metrics:
+                        v_loss_str = f", v={metrics.get('value_loss', 0.0):.4f}" if self.enable_value_head else ""
+                        nn_loss_info = f" | NN Loss: {metrics.get('total_loss', 0.0):.4f} (p={metrics.get('policy_loss', 0.0):.4f}{v_loss_str})"
+                        print(f"[Iter {iter_idx+1}] � 异步训练状态: {metrics.get('policy_loss', 0.0):.4f}")
+                    stats = self.async_trainer.get_stats()
+                    print(f"  �🔄 后台训练: {stats['total_steps']} steps, 平均 {stats.get('avg_time_per_step', 0)*1000:.1f}ms/step")
+                else:
+                    # 同步模式：原逻辑
+                    print(f"[Iter {iter_idx+1}] 🔄 更新NN...")
+                    total_policy_loss = 0.0
+                    total_value_loss = 0.0
+                    total_loss = 0.0
+                    for step_idx in range(self.args.train_steps_per_update):
+                        losses = self.train_step()
+                        if losses:
+                            total_policy_loss += losses['policy_loss']
+                            total_value_loss += losses.get('value_loss', 0.0)
+                            total_loss += losses['total_loss']
+                            if step_idx == 0 or (step_idx + 1) % 10 == 0:  # 输出首次和每10步
+                                # 附带策略目标分布诊断，帮助定位 policy_loss=0 的根因
+                                v_str = f", v={losses.get('value_loss', 0.0):.4f}" if self.enable_value_head else ""
+                                diag_msg = (
+                                    f"pt_sum(mean={losses['pt_sum_mean']:.3f}, min={losses['pt_sum_min']:.3f}, max={losses['pt_sum_max']:.3f}), "
+                                    f"pt_nz(mean={losses['pt_nz_mean']:.1f}), "
+                                    f"pt_H(mean={losses['pt_entropy_mean']:.3f}), "
+                                    f"p(correct)_mean={losses['pred_correct_prob_mean']:.3f}, "
+                                    f"top1_acc={losses['pred_top1_acc']:.2f}, "
+                                    f"H_pred={losses.get('policy_entropy', 0.0):.3f}"
+                                )
+                                if losses.get('pt_any_zero_sum') or losses.get('pt_any_nan_sum'):
+                                    diag_msg += " | ALERT: target_sum_zero_or_nan"
+                                print(
+                                    f"  Step {step_idx+1}/{self.args.train_steps_per_update}: "
+                                    f"policy={losses['policy_loss']:.4f}{v_str}, "
+                                    f"total={losses['total_loss']:.4f} | " + diag_msg
+                                )
+                    # 平均loss
+                    n_steps = self.args.train_steps_per_update
+                    avg_policy = total_policy_loss / n_steps
+                    avg_value = total_value_loss / n_steps
+                    avg_total = total_loss / n_steps
+                    v_loss_str = f", v={avg_value:.4f}" if self.enable_value_head else ""
+                    nn_loss_info = f" | NN Loss: {avg_total:.4f} (p={avg_policy:.4f}{v_loss_str})"
+                    print(f"  ✅ 平均Loss: policy={avg_policy:.4f}{v_loss_str}, total={avg_total:.4f}")
                 
                 # 🧹 定期内存清理（防止内存泄漏）
                 import gc
@@ -1432,25 +1689,39 @@ class OnlineTrainer:
                     else:
                         print(f"  ⏸️  Ranking训练跳过 (buffer={buffer_size}对 < 8对最小值)")
                 
+                ranking_paused_async = False
                 if self.use_ranking and self.ranking_buffer is not None and len(self.ranking_buffer) >= 8:
-                    ranking_loss_total = 0.0
-                    ranking_acc_total = 0.0
-                    ranking_steps = min(10, max(1, len(self.ranking_buffer) // 8))  # 自适应步数（降低批次大小）
-                    for _ in range(ranking_steps):
-                        ranking_metrics = train_ranking_step(
-                            ranking_net=self.ranking_net,
-                            ranking_buffer=self.ranking_buffer,
-                            ranking_optimizer=self.ranking_optimizer,
-                            gnn_encoder=self.nn_model,
-                            device=self.device,
-                            batch_size=min(8, len(self.ranking_buffer))  # 动态batch size
-                        )
-                        if ranking_metrics:
-                            ranking_loss_total += ranking_metrics['ranking_loss']
-                            ranking_acc_total += ranking_metrics['ranking_accuracy']
-                    avg_ranking_loss = ranking_loss_total / ranking_steps
-                    avg_ranking_acc = ranking_acc_total / ranking_steps
-                    print(f"  ✅ Ranking训练完成: loss={avg_ranking_loss:.4f}, accuracy={avg_ranking_acc:.2%}")
+                    if self.async_training and self.async_trainer is not None:
+                        self.async_trainer.pause_and_wait()
+                        ranking_paused_async = True
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+
+                    try:
+                        ranking_loss_total = 0.0
+                        ranking_acc_total = 0.0
+                        ranking_steps = min(10, max(1, len(self.ranking_buffer) // 8))  # 自适应步数（降低批次大小）
+                        for _ in range(ranking_steps):
+                            ranking_metrics = train_ranking_step(
+                                ranking_net=self.ranking_net,
+                                ranking_buffer=self.ranking_buffer,
+                                ranking_optimizer=self.ranking_optimizer,
+                                gnn_encoder=self.nn_model,
+                                device=self.device,
+                                batch_size=min(8, len(self.ranking_buffer))  # 动态batch size
+                            )
+                            if ranking_metrics:
+                                ranking_loss_total += ranking_metrics['ranking_loss']
+                                ranking_acc_total += ranking_metrics['ranking_accuracy']
+                        avg_ranking_loss = ranking_loss_total / ranking_steps
+                        avg_ranking_acc = ranking_acc_total / ranking_steps
+                        print(f"  ✅ Ranking训练完成: loss={avg_ranking_loss:.4f}, accuracy={avg_ranking_acc:.2%}")
+                    finally:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        if ranking_paused_async and self.async_trainer is not None:
+                            self.async_trainer.resume()
                     
                     # 🎓 课程学习：逐步提高ranking混合系数
                     if iter_idx < self.ranking_blend_warmup_iters:
@@ -1460,23 +1731,63 @@ class OnlineTrainer:
                             print(f"  📈 Ranking混合系数: {self.ranking_blend_factor:.2f}")
             
             # 更新最佳程序
-            if reward > self.best_reward:
-                self.best_reward = reward
+            # 🌟 使用真实奖励进行best_reward比较（避免训练惩罚项退火导致的虚假进步）
+            if reward_true > self.best_reward:
+                self.best_reward = reward_true
                 self.best_program = next_program
                 # 🔒 深拷贝保护,防止cleanup_tree或GC清理
                 import copy
                 self.best_program_copy = copy.deepcopy(next_program)
-                print(f"[Iter {iter_idx+1}] 🎉 新最佳！奖励: {reward:.4f}")
+                print(f"[Iter {iter_idx+1}] 🎉 新最佳！真实奖励: {reward_true:.4f} (训练奖励: {reward_train:.4f})")
                 
-                # 保存
-                save_program_json(self.best_program, self.args.save_path)
-                # 追加程序历史（内部会再次评估以获取组件；如果我们已有组件，传递优化 TODO: 未来去重）
-                self._append_program_history(iter_idx, reward, self.best_program)
+                # 🔐 安全检查：只有比已保存文件更优才覆盖保存（使用真实奖励比较）
+                saved_reward = self._get_saved_program_reward(self.args.save_path)
+                should_save = reward_true > saved_reward
+                
+                if should_save:
+                    # 构建元数据：记录训练进度和奖励信息（保存真实奖励）
+                    program_meta = {
+                        'iteration': iter_idx + 1,
+                        'total_iterations': self.args.total_iters,
+                        'reward': float(reward_true),  # 🌟 保存真实奖励
+                        'reward_train': float(reward_train),  # 附带训练奖励供参考
+                        'best_reward': float(self.best_reward),  # 当前最佳真实奖励
+                        'trajectory': getattr(self.args, 'traj', 'unknown'),
+                        'duration': getattr(self.args, 'duration', 10),
+                        'reward_profile': getattr(self.args, 'reward_profile', 'control_law_discovery'),
+                        'mcts_simulations': self.args.mcts_simulations,
+                        'isaac_num_envs': self.args.isaac_num_envs,
+                    }
+                    
+                    # 添加奖励组件详情（如果可用）
+                    if reward_components:
+                        program_meta['reward_components'] = {k: float(v) for k, v in reward_components.items()}
+                    
+                    # 添加程序结构信息
+                    program_info = self._analyze_program(self.best_program)
+                    if program_info:
+                        program_meta.update({
+                            'num_rules': program_info.get('num_rules', 0),
+                            'num_variables': program_info.get('num_variables', 0),
+                            'depth': program_info.get('depth', 0),
+                        })
+                    
+                    # 保存（带元数据）
+                    save_program_json(self.best_program, self.args.save_path, meta=program_meta)
+                    if saved_reward == float('-inf'):
+                        print(f"  💾 已保存到: {self.args.save_path} (真实奖励: {reward_true:.4f})")
+                    else:
+                        print(f"  💾 已保存到: {self.args.save_path} (真实奖励: {reward_true:.4f}, 超越已保存: {saved_reward:.4f})")
+                    
+                    # 追加程序历史（使用真实奖励）
+                    self._append_program_history(iter_idx, reward_true, self.best_program)
+                else:
+                    print(f"  ⏸️  未保存：当前真实奖励 {reward_true:.4f} ≤ 已保存 {saved_reward:.4f}（跳过覆盖）")
             
-            # 🏆 更新精英程序池 (保留Top-K最优)
+            # 🏆 更新精英程序池 (保留Top-K最优，使用真实奖励排序)
             import copy
-            self.elite_archive.append((reward, copy.deepcopy(next_program), iter_idx + 1))
-            # 按reward降序排序,保留Top-K
+            self.elite_archive.append((reward_true, copy.deepcopy(next_program), iter_idx + 1))
+            # 按真实reward降序排序,保留Top-K
             self.elite_archive.sort(key=lambda x: x[0], reverse=True)
             if len(self.elite_archive) > self.elite_archive_size:
                 self.elite_archive = self.elite_archive[:self.elite_archive_size]
@@ -1519,13 +1830,26 @@ class OnlineTrainer:
                     gpu_max_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
                     mem_info += f" | GPU: {gpu_mb:.0f}MB (峰值{gpu_max_mb:.0f}MB)"
             
-            print(f"[Iter {iter_idx+1}] 完成 | 奖励: {reward:.4f} | 耗时: {iter_time:.1f}s | Buffer: {len(self.replay_buffer)}{mcts_info}{nn_loss_info}{mem_info}")
+            # ⭐ 简化输出：仅在指定间隔打印详细信息（使用真实奖励）
+            if show_iter_detail:
+                print(f"[Iter {iter_idx+1}] 完成 | 真实奖励: {reward_true:.4f} | 耗时: {iter_time:.1f}s | Buffer: {len(self.replay_buffer)}{mcts_info}{nn_loss_info}{mem_info}")
+            else:
+                # 简洁模式：仅显示进度百分比
+                progress_pct = (iter_idx + 1) / self.args.total_iters * 100
+                print(f"\r[进度 {progress_pct:.1f}%] {iter_idx+1}/{self.args.total_iters} 轮 | 真实奖励: {reward_true:.4f} | Buffer: {len(self.replay_buffer)}", end='', flush=True)
             
             # 定期保存检查点
             if (iter_idx + 1) % self.args.checkpoint_freq == 0:
                 checkpoint_path = f"{self.args.save_path.replace('.json', '')}_nn_iter_{iter_idx+1}.pt"
                 torch.save(self.nn_model.state_dict(), checkpoint_path)
                 print(f"[Iter {iter_idx+1}] 💾 检查点已保存: {checkpoint_path}")
+        
+        # 🔄 停止异步训练器
+        if self.async_trainer is not None:
+            print(f"[Trainer] 🛑 停止异步训练器...")
+            self.async_trainer.stop(wait=True)
+            stats = self.async_trainer.get_stats()
+            print(f"  总训练步数: {stats['total_steps']}, 总耗时: {stats.get('total_time', 0):.1f}s")
         
         print(f"\n{'='*80}")
         print(f"训练完成！最佳奖励: {self.best_reward:.4f}")
@@ -1571,8 +1895,31 @@ class OnlineTrainer:
         if self.best_program_copy is not None:
             try:
                 final_save_path = self.args.save_path.replace('.json', '_final.json')
-                save_program_json(self.best_program_copy, final_save_path)
+                
+                # 构建最终元数据
+                final_meta = {
+                    'final_iteration': self.args.total_iters,
+                    'best_reward': float(self.best_reward),
+                    'trajectory': getattr(self.args, 'traj', 'unknown'),
+                    'duration': getattr(self.args, 'duration', 10),
+                    'reward_profile': getattr(self.args, 'reward_profile', 'control_law_discovery'),
+                    'mcts_simulations': self.args.mcts_simulations,
+                    'isaac_num_envs': self.args.isaac_num_envs,
+                    'training_completed': True,
+                }
+                
+                # 添加程序结构信息
+                program_info = self._analyze_program(self.best_program_copy)
+                if program_info:
+                    final_meta.update({
+                        'num_rules': program_info.get('num_rules', 0),
+                        'num_variables': program_info.get('num_variables', 0),
+                        'depth': program_info.get('depth', 0),
+                    })
+                
+                save_program_json(self.best_program_copy, final_save_path, meta=final_meta)
                 print(f"🔒 最优程序(保护副本)已保存: {final_save_path}")
+                print(f"   最终奖励: {self.best_reward:.4f} | 规则数: {final_meta.get('num_rules', 'N/A')}")
             except Exception as e:
                 print(f"⚠️  最优程序保存失败: {e}")
 
@@ -1591,20 +1938,61 @@ def parse_args():
     # NN参数（固定特征网络已移除，统一使用GNN v2，只训练policy）
     p.add_argument('--learning-rate', type=float, default=1e-3, help='学习率')
     
+    # GNN 架构参数
+    p.add_argument('--gnn-structure-hidden', type=int, default=256, help='GNN结构编码器隐藏层维度（默认256）')
+    p.add_argument('--gnn-structure-layers', type=int, default=5, help='GNN结构编码器层数（默认5）')
+    p.add_argument('--gnn-structure-heads', type=int, default=8, help='GNN结构编码器注意力头数（默认8）')
+    p.add_argument('--gnn-feature-layers', type=int, default=3, help='GNN特征编码器层数（默认3）')
+    p.add_argument('--gnn-feature-heads', type=int, default=8, help='GNN特征编码器注意力头数（默认8）')
+    p.add_argument('--gnn-dropout', type=float, default=0.1, help='GNN Dropout比例（默认0.1）')
+    
     # MCTS参数
     p.add_argument('--exploration-weight', type=float, default=2.5, help='UCB探索权重 (提高以增强广度探索)')
     p.add_argument('--puct-c', type=float, default=1.5, help='PUCT常数')
     p.add_argument('--max-depth', type=int, default=12, help='MCTS最大深度（降低以减少分支稀释）')
+    p.add_argument('--mcts-leaf-batch-size', type=int, default=1, help='MCTS叶节点批量评估大小（>1启用并行化，推荐4-10）')
+    p.add_argument('--async-training', action='store_true', help='启用异步训练模式：MCTS与NN训练并行（实验性功能）')
+    p.add_argument('--async-update-interval', type=float, default=0.1, help='异步训练线程两次训练之间的最小间隔（秒）')
+    p.add_argument('--async-max-steps-per-iter', type=int, default=None, help='每轮允许的异步训练步数上限（None表示不限）')
+    
+    # 高级优化开关
+    p.add_argument('--enable-ranking-mcts-bias', action='store_true', help='启用Ranking对MCTS子节点先验加权（打破plateau）')
+    p.add_argument('--ranking-bias-beta', type=float, default=0.3, help='Ranking bias强度（默认0.3）')
+    p.add_argument('--enable-value-head', action='store_true', help='启用Value头辅助训练（仅用于梯度信号，不影响MCTS）')
+    p.add_argument('--enable-ranking-reweight', action='store_true', help='用Ranking score重新加权policy target')
+    p.add_argument('--ranking-reweight-beta', type=float, default=0.2, help='Ranking reweight强度（默认0.2）')
+    
     # 注意：已移除 --real-sim-frac 和 --force-full-sim，现在全部使用真实仿真
     # AlphaZero 式探索增强
     p.add_argument('--root-dirichlet-eps', type=float, default=0.25, help='根节点先验混合 Dirichlet 噪声比例 eps (0 关闭)')
     p.add_argument('--root-dirichlet-alpha', type=float, default=0.3, help='根节点 Dirichlet 噪声 alpha 参数')
     p.add_argument('--policy-temperature', type=float, default=1.0, help='根节点根据访问计数采样的温度系数，1 为按访问计数成比例采样，0 为贪心')
+    
+    # Meta-RL 在线调参（可选）
+    p.add_argument('--use-meta-rl', action='store_true', help='启用 Meta-RL RNN 控制器进行动态超参数调整（需要预训练模型）')
+    p.add_argument('--meta-rl-checkpoint', type=str, default='meta_rl/checkpoints/meta_policy.pt', help='Meta-RL 模型检查点路径')
+    
+    # 启发式衰减参数（当不使用 Meta-RL 时生效）
+    p.add_argument('--root-dirichlet-eps-init', type=float, default=None, help='Dirichlet eps 初始值（启发式衰减模式，None则使用--root-dirichlet-eps）')
+    p.add_argument('--root-dirichlet-eps-final', type=float, default=None, help='Dirichlet eps 终止值（启发式衰减模式）')
+    p.add_argument('--root-dirichlet-alpha-init', type=float, default=None, help='Dirichlet alpha 初始值（启发式衰减模式，None则使用--root-dirichlet-alpha）')
+    p.add_argument('--root-dirichlet-alpha-final', type=float, default=None, help='Dirichlet alpha 终止值（启发式衰减模式）')
+    p.add_argument('--heuristic-decay-window', type=int, default=200, help='启发式衰减窗口（多少轮内完成退火，默认200）')
     # 打破奖励常数死区：零动作惩罚参数化（支持课程化衰减）
     p.add_argument('--zero-action-penalty', type=float, default=0.0, help='对整集始终零动作的程序施加惩罚（初始值；0=无惩罚）')
     p.add_argument('--zero-action-penalty-decay', type=float, default=0.95, help='零动作惩罚每轮衰减因子（<1启用课程化；1=不衰减；默认0.95）')
     p.add_argument('--zero-action-penalty-min', type=float, default=0.1, help='零动作惩罚最小值（课程化下限；默认0.1）')
     p.add_argument('--action-scale-multiplier', type=float, default=1.0, help='动作输出全局缩放系数（临时用于验证是否死区；1=不缩放）')
+    p.add_argument('--enable-output-mad', dest='enable_output_mad', action='store_true', help='启用输出MAD安全壳（幅值/方向/变化率约束）')
+    p.add_argument('--disable-output-mad', dest='enable_output_mad', action='store_false', help='禁用输出MAD安全壳（不建议）')
+    p.set_defaults(enable_output_mad=True)
+    p.add_argument('--mad-min-fz', type=float, default=0.0, help='输出安全壳：u_fz 最小值（牛顿）')
+    p.add_argument('--mad-max-fz', type=float, default=7.5, help='输出安全壳：u_fz 最大值（牛顿）')
+    p.add_argument('--mad-max-xy', type=float, default=0.12, help='输出安全壳：横向力矩/力幅值上限')
+    p.add_argument('--mad-max-yaw', type=float, default=0.04, help='输出安全壳：yaw 力矩幅值上限')
+    p.add_argument('--mad-max-delta-fz', type=float, default=1.5, help='输出安全壳：相邻步 u_fz 最大变化量')
+    p.add_argument('--mad-max-delta-xy', type=float, default=0.03, help='输出安全壳：相邻步横向力矩变化上限')
+    p.add_argument('--mad-max-delta-yaw', type=float, default=0.02, help='输出安全壳：相邻步 yaw 力矩变化上限')
     
     # Ranking Value Network参数（自适应奖励学习，打破平坦奖励困境）
     p.add_argument('--use-ranking', type=lambda x: str(x).lower() in ['true', '1', 'yes'], default=True, 
@@ -1623,17 +2011,31 @@ def parse_args():
     p.add_argument('--reward-reduction', type=str, default='sum', choices=['sum','mean'], help="奖励归约方式：'sum'（步次求和）或 'mean'（步次平均）")
     # 🔥 奖励权重配置（新增）
     p.add_argument('--reward-profile', type=str, default='control_law_discovery', 
-                   choices=['default', 'pilight_boost', 'pilight_freq_boost', 'control_law_discovery', 'smooth_control', 'balanced_smooth'],
+                   choices=['default', 'pilight_boost', 'pilight_freq_boost', 'control_law_discovery', 'smooth_control', 'balanced_smooth', 
+                            'safety_first', 'tracking_first', 'balanced', 'robustness_stability'],
                    help='奖励权重配置文件: smooth_control强调平滑度和控制代价，control_law_discovery强调鲁棒性（默认）')
+    p.add_argument('--prior-profile', type=str, default='none', choices=list(PRIOR_PROFILES.keys()),
+                   help='结构/稳定先验实验分组：none(A组)、structure(B组)、structure_stability(C组)')
+    p.add_argument('--structure-prior-weight', type=float, default=None,
+                   help='覆盖结构先验权重（默认None表示使用 profile 内置值）')
+    p.add_argument('--stability-prior-weight', type=float, default=None,
+                   help='覆盖稳定性先验权重（默认None表示使用 profile 内置值）')
     # AST-first pipeline switch
     p.add_argument('--ast-pipeline', action='store_true', help='启用AST优先管线：内部统一AST表示，对外序列化为dict')
     # Debug programs explored during MCTS
     p.add_argument('--debug-programs', action='store_true', help='调试：打印搜索过程中扩展的程序摘要（仅根与其下一层，限数量）')
     p.add_argument('--debug-programs-limit', type=int, default=20, help='调试程序打印条数上限（全程累积）')
     p.add_argument('--use-fast-path', action='store_true', help='启用超高性能优化路径（环境池复用+Numba JIT编译，7×加速）')
-    p.add_argument('--use-dummy-eval', action='store_true', help='强制使用Dummy评估器（禁用Isaac Gym），用于快速A/B基准')
+    p.add_argument('--disable-gpu-expression', action='store_true', help='关闭GPU表达式执行器，回退到CPU求值')
     p.add_argument('--prior-level', type=int, default=2, choices=[2, 3], 
                    help='先验级别: 2=中度(保留三轴+姿态), 3=严格(仅位置误差/速度/角速度)')
+    
+    # 🔥 贝叶斯优化调参（内层参数优化）
+    p.add_argument('--enable-bayesian-tuning', action='store_true', help='启用贝叶斯优化对程序常数参数进行自动调优（AAAI 2024 π-Light策略）')
+    p.add_argument('--bo-batch-size', type=int, default=50, help='BO每次并行评估的参数组数（利用Isaac并行环境，默认50）')
+    p.add_argument('--bo-iterations', type=int, default=3, help='BO迭代次数（默认3，总评估 batch_size × iterations 组参数）')
+    p.add_argument('--bo-param-range-min', type=float, default=-3.0, help='BO参数搜索下界（默认-3.0）')
+    p.add_argument('--bo-param-range-max', type=float, default=3.0, help='BO参数搜索上界（默认3.0）')
     
     # 保存参数
     p.add_argument('--save-path', type=str, default='01_pi_flight/results/online_best_program.json')

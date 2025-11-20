@@ -62,7 +62,6 @@ def run_and_analyze(prior_level: int):
         min_steps_frac=0.0,
         reward_reduction='sum',
         use_fast_path=True,
-        use_dummy_eval=False,
         save_path=str(PKG / f"results/check_program_prior{prior_level}.json"),
         checkpoint_freq=10**9,
         warm_start=None,
