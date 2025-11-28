@@ -59,7 +59,7 @@ def main():
     parser.add_argument('--aggregate', type=str, default='harmonic',
                         choices=['mean', 'min', 'harmonic'])
     parser.add_argument('--duration', type=int, default=20)
-    parser.add_argument('--reward_profile', type=str, default='control_law_discovery')
+    parser.add_argument('--reward_profile', type=str, default='safe_control_tracking', choices=['safe_control_tracking'])
     parser.add_argument('--output', type=str, default=None,
                         help='输出 JSON 文件路径（可选）')
     args = parser.parse_args()

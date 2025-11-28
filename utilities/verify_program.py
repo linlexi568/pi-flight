@@ -168,7 +168,7 @@ def parse_args():
     ap.add_argument('--disturbance', type=str, default='mild_wind', choices=[None,'mild_wind','stress'])
     ap.add_argument('--duration', type=int, default=20)
     ap.add_argument('--log-skip', type=int, default=2)
-    ap.add_argument('--reward_profile', type=str, default='pilight_boost', choices=['default','pilight_boost','pilight_freq_boost','control_law_discovery'])
+    ap.add_argument('--reward_profile', type=str, default='safe_control_tracking', choices=['safe_control_tracking'])
     ap.add_argument('--compose-by-gain', action='store_true')
     ap.add_argument('--clip-P', type=float, default=None)
     ap.add_argument('--clip-I', type=float, default=None)

@@ -48,7 +48,8 @@ cat compare/metrics_*.csv
 ## 需要的数据来源示例
 
 - **PID 基线**：使用 `utilities/verify_program.py` 对标准增益或手动调参的程序进行评估。
-- **PPO 基线**：位于 `02_PPO/` 的 `baseline_ppo.py`，可在训练完成后使用 `--mode eval` 导出曲线。
+- **PPO/SAC 基线**：使用 `scripts/baselines/eval_safecontrol_baselines.py` 调用
+	safe-control-gym 风格的模型，在 Isaac Gym 中评估并输出统一 JSON 指标。
 - **Program (π-Flight)**：使用 `01_pi_flight/train_online.py` 生成的最优程序，再用 `utilities/verify_program.py` 做统一评估。
 
 如需新增任务或指标，只需在此目录添加相应脚本/文档并在 README 中补充说明即可。

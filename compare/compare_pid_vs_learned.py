@@ -52,7 +52,7 @@ LEARNED_PROGRAM_PATH = os.path.join(_ROOT, "results", "online_best_program.json"
 # 评估设置
 TRAJECTORY = "figure8"
 DURATION = 10  # 秒（与训练保持一致）
-REWARD_PROFILE = "control_law_discovery"
+REWARD_PROFILE = "safe_control_tracking"
 ISAAC_NUM_ENVS = 4096
 EVAL_REPLICAS = 3  # 每个程序跑几次取平均
 

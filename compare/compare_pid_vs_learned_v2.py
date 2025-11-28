@@ -33,15 +33,8 @@ LEARNED_PROGRAM_PATH = os.path.join(_ROOT, "results", "online_best_program.json"
 TRAJECTORY = "figure8"
 DURATION = 10  # 秒（与训练保持一致）
 
-# 🔥 奖励 profile - 可选：
-#   "safety_first"           - 保守、平滑、节能（强调安全性）
-#   "tracking_first"         - 激进跟踪、允许大动作（强调跟踪精度）
-#   "balanced"               - 折中方案（综合平衡）
-#   "robustness_stability"   - 鲁棒性+稳定性优先（你之前的主实验，强调抗扰动、增益稳定）
-#   "control_law_discovery"  - 同 robustness_stability（别名，向后兼容）
-#   "smooth_control"         - 平滑控制优先
-#   "balanced_smooth"        - 平衡平滑
-REWARD_PROFILE = "robustness_stability"  # 🔥 修改这里切换不同奖励策略
+# 奖励 profile 固定为 SCG 对齐版本
+REWARD_PROFILE = "safe_control_tracking"
 
 ISAAC_NUM_ENVS = 4096
 EVAL_REPLICAS = 3  # 每个程序跑几次取平均

@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 from .dsl import (
     ProgramNode,
     TerminalNode,
+    ConstantNode,
     UnaryOpNode,
     BinaryOpNode,
     IfNode,
@@ -35,8 +36,31 @@ ASTDict = Dict[str, Any]
 def serialize_ast(node: ProgramNode) -> ASTDict:
     if isinstance(node, TerminalNode):
         return {"type": "Terminal", "value": node.value}
+    
+    if isinstance(node, ConstantNode):
+        result = {"type": "Constant", "value": node.value}
+        if node.name:
+            result["name"] = node.name
+        if node.min_val is not None:
+            result["min_val"] = node.min_val
+        if node.max_val is not None:
+            result["max_val"] = node.max_val
+        return result
+    
     if isinstance(node, UnaryOpNode):
-        return {"type": "Unary", "op": node.op, "child": serialize_ast(node.child)}
+        result = {"type": "Unary", "op": node.op, "child": serialize_ast(node.child)}
+        # 序列化参数字典（新格式）
+        if node.params:
+            params_serialized = {}
+            for key, val in node.params.items():
+                if isinstance(val, ConstantNode):
+                    params_serialized[key] = serialize_ast(val)
+                elif isinstance(val, (int, float)):
+                    params_serialized[key] = {"type": "Constant", "value": float(val)}
+            if params_serialized:
+                result["params"] = params_serialized
+        return result
+    
     if isinstance(node, BinaryOpNode):
         return {"type": "Binary", "op": node.op, "left": serialize_ast(node.left), "right": serialize_ast(node.right)}
     if isinstance(node, IfNode):
@@ -47,8 +71,24 @@ def deserialize_ast(obj: ASTDict) -> ProgramNode:
     t = obj.get("type")
     if t == "Terminal":
         return TerminalNode(obj["value"])
+    
+    if t == "Constant":
+        return ConstantNode(
+            value=obj["value"],
+            name=obj.get("name"),
+            min_val=obj.get("min_val"),
+            max_val=obj.get("max_val")
+        )
+    
     if t == "Unary":
-        return UnaryOpNode(obj["op"], deserialize_ast(obj["child"]))
+        child = deserialize_ast(obj["child"])
+        params = None
+        if "params" in obj:
+            params = {}
+            for key, val_dict in obj["params"].items():
+                params[key] = deserialize_ast(val_dict)
+        return UnaryOpNode(obj["op"], child, params)
+    
     if t == "Binary":
         return BinaryOpNode(obj["op"], deserialize_ast(obj["left"]), deserialize_ast(obj["right"]))
     if t == "If":

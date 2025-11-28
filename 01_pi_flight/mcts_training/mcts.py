@@ -3,14 +3,44 @@ from typing import List, Any, Dict, Optional, Tuple, Set, Callable, Union
 
 # Import DSL nodes from parent package
 try:
-    from ..core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+    from ..core.dsl import (
+        ProgramNode,
+        TerminalNode,
+        ConstantNode,
+        UnaryOpNode,
+        BinaryOpNode,
+        IfNode,
+        MIN_EMA_ALPHA,
+        MAX_EMA_ALPHA,
+        MAX_DELAY_STEPS,
+        MAX_DIFF_STEPS,
+        SAFE_VALUE_MIN,
+        SAFE_VALUE_MAX,
+        MAX_RATE_LIMIT,
+        MAX_SMOOTH_SCALE
+    )
 except Exception:
     # Fallback for script mode
     import sys, pathlib
     _parent = pathlib.Path(__file__).resolve().parent.parent
     if str(_parent) not in sys.path:
         sys.path.insert(0, str(_parent))
-    from core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+    from core.dsl import (
+        ProgramNode,
+        TerminalNode,
+        ConstantNode,
+        UnaryOpNode,
+        BinaryOpNode,
+        IfNode,
+        MIN_EMA_ALPHA,
+        MAX_EMA_ALPHA,
+        MAX_DELAY_STEPS,
+        MAX_DIFF_STEPS,
+        SAFE_VALUE_MIN,
+        SAFE_VALUE_MAX,
+        MAX_RATE_LIMIT,
+        MAX_SMOOTH_SCALE
+    )
 
 try:
     from ..utils.prior_scoring import compute_prior_scores
@@ -29,6 +59,37 @@ except Exception:
         CHANNEL_ALLOWED_INPUTS = {}
         def allowed_variables_for_channel(channel: str, available):  # type: ignore
             return list(available)
+
+UNARY_PARAM_SPECS = {
+    'ema': [
+        ('alpha', MIN_EMA_ALPHA, MAX_EMA_ALPHA, 0.2)
+    ],
+    'delay': [
+        ('k', 1.0, float(MAX_DELAY_STEPS), 1.0)
+    ],
+    'diff': [
+        ('k', 1.0, float(MAX_DIFF_STEPS), 1.0)
+    ],
+    'clamp': [
+        ('lo', SAFE_VALUE_MIN, SAFE_VALUE_MAX, -2.0),
+        ('hi', SAFE_VALUE_MIN, SAFE_VALUE_MAX, 2.0)
+    ],
+    'deadzone': [
+        ('eps', 0.0, 1.0, 0.01)
+    ],
+    'rate': [
+        ('r', 0.01, MAX_RATE_LIMIT, 1.0)
+    ],
+    'rate_limit': [
+        ('r', 0.01, MAX_RATE_LIMIT, 1.0)
+    ],
+    'smooth': [
+        ('s', 1e-3, MAX_SMOOTH_SCALE, 1.0)
+    ],
+    'smoothstep': [
+        ('s', 1e-3, MAX_SMOOTH_SCALE, 1.0)
+    ]
+}
 
 class MCTSNode:
     """Tree node with progressive widening & action cache.
@@ -206,6 +267,20 @@ class MCTS_Agent:
         self._full_action_prob = 0.0
         # 是否在 warm start 后补齐到最小规则数（默认关闭，避免破坏热启动基线）
         self._pad_after_warm_start = False
+
+        # ============================================================================
+        # 悬停推力约束（Hover Thrust Constraint）
+        # ============================================================================
+        # 是否强制 u_fz 表达式包含基础悬停推力项
+        # 当启用时，u_fz = hover_thrust + delta_expr，确保无人机始终有最小升力
+        self._enforce_hover_thrust = True
+        # Crazyflie 悬停推力 = mass * g = 0.027 * 9.81 ≈ 0.265 N
+        self._hover_thrust_value = 0.265
+        # 悬停推力搜索范围（用于 BO/参数优化）
+        self._hover_thrust_min = 0.20
+        self._hover_thrust_max = 0.35
+        # delta 项的裁剪范围（限制偏离悬停的幅度）
+        self._hover_delta_max = 2.0  # 允许 hover ± 2N
 
         # Pre-cache mutation actions for root
         self._ensure_mutations(self.root)
@@ -1274,6 +1349,14 @@ class MCTS_Agent:
 
     def _generate_random_expression_for_channel(self, channel: str, depth: int = 0, max_depth: int = 3) -> ProgramNode:
         import random
+        
+        # ============================================================================
+        # 悬停推力约束：u_fz 通道强制包含基础悬停项
+        # ============================================================================
+        # 仅在顶层（depth=0）且是 u_fz 通道时应用
+        if channel == 'u_fz' and depth == 0 and getattr(self, '_enforce_hover_thrust', True):
+            return self._generate_hover_constrained_fz_expr(max_depth)
+        
         # 叶子：变量或常数，并可能包一元函数
         if depth >= max_depth or random.random() < 0.35:
             allowed_vars = self._channel_allowed_vars(channel)
@@ -1288,7 +1371,7 @@ class MCTS_Agent:
                                 'ema','delay','diff','clamp','deadzone','rate','rate_limit','smooth','smoothstep')
             unary_pool = [op for op in self.dsl_operators if _is_unary(op)]
             if unary_pool and random.random() < 0.4:
-                node = UnaryOpNode(random.choice(unary_pool), node)
+                node = self._create_unary_node_with_params(random.choice(unary_pool), node)
             return node
         # 内部：二元组合
         left = self._generate_random_expression_for_channel(channel, depth+1, max_depth)
@@ -1296,6 +1379,125 @@ class MCTS_Agent:
         bin_pool = [op for op in self.dsl_operators if op in ('+','-','*','/','max','min')]
         op = random.choice(bin_pool) if bin_pool else '*'
         return BinaryOpNode(op, left, right)
+
+    def _generate_hover_constrained_fz_expr(self, max_depth: int = 3) -> ProgramNode:
+        """
+        生成带悬停推力约束的 u_fz 表达式。
+        
+        结构: u_fz = hover_thrust + clamp(delta_expr, -delta_max, +delta_max)
+        
+        其中:
+        - hover_thrust: 可优化的悬停推力常量（默认 0.265N for Crazyflie）
+        - delta_expr: 基于状态变量的控制增量（如 PD 控制项）
+        - clamp: 限制偏离悬停的范围，防止过大推力
+        
+        这确保无人机始终有最小升力，不会因程序输出0而坠落。
+        """
+        import random
+        
+        hover_val = float(getattr(self, '_hover_thrust_value', 0.265))
+        hover_min = float(getattr(self, '_hover_thrust_min', 0.20))
+        hover_max = float(getattr(self, '_hover_thrust_max', 0.35))
+        delta_max = float(getattr(self, '_hover_delta_max', 2.0))
+        
+        # 创建可优化的悬停推力常量节点
+        hover_node = ConstantNode(
+            value=hover_val,
+            name='hover_thrust',
+            min_val=hover_min,
+            max_val=hover_max
+        )
+        
+        # 生成控制增量表达式（delta_expr）
+        # 常见模式:
+        #   1. PD: k_p * pos_err_z + k_d * vel_z
+        #   2. 单变量: k * pos_err_z
+        #   3. 复合: 随机生成的表达式
+        pattern = random.choice(['pd', 'single', 'random'])
+        
+        if pattern == 'pd':
+            # PD 控制增量: k_p * pos_err_z + k_d * vel_z
+            k_p = ConstantNode(
+                value=random.uniform(0.5, 2.0),
+                name='kp_z',
+                min_val=0.1,
+                max_val=5.0
+            )
+            k_d = ConstantNode(
+                value=random.uniform(0.1, 1.0),
+                name='kd_z',
+                min_val=0.01,
+                max_val=2.0
+            )
+            p_term = BinaryOpNode('*', k_p, TerminalNode('pos_err_z'))
+            d_term = BinaryOpNode('*', k_d, TerminalNode('vel_z'))
+            delta_expr = BinaryOpNode('+', p_term, d_term)
+        
+        elif pattern == 'single':
+            # 单变量控制: k * state_var
+            allowed_vars = self._channel_allowed_vars('u_fz')
+            # 优先选择与高度相关的变量
+            z_vars = [v for v in allowed_vars if 'z' in v.lower() or 'err' in v.lower()]
+            var = random.choice(z_vars) if z_vars else (random.choice(allowed_vars) if allowed_vars else 'pos_err_z')
+            k = ConstantNode(
+                value=random.uniform(0.5, 2.0),
+                name='k_fz',
+                min_val=0.1,
+                max_val=5.0
+            )
+            delta_expr = BinaryOpNode('*', k, TerminalNode(var))
+        
+        else:
+            # 随机生成的表达式（从 depth=1 开始，避免递归回到这里）
+            delta_expr = self._generate_random_expression_for_channel('u_fz', depth=1, max_depth=max_depth)
+        
+        # 用 clamp 限制 delta 范围
+        clamped_delta = UnaryOpNode('clamp', delta_expr, {
+            'lo': ConstantNode(-delta_max, 'delta_lo', -5.0, 0.0),
+            'hi': ConstantNode(delta_max, 'delta_hi', 0.0, 5.0)
+        })
+        
+        # 最终表达式: hover_thrust + clamped_delta
+        result = BinaryOpNode('+', hover_node, clamped_delta)
+        
+        return result
+
+    def _create_unary_node_with_params(self, descriptor: str, child: ProgramNode) -> UnaryOpNode:
+        """将形如 'ema:0.2' 的描述符转换为带 ConstantNode 参数的 UnaryOpNode."""
+        if not isinstance(descriptor, str):
+            return UnaryOpNode(descriptor, child)
+
+        if ':' in descriptor:
+            base, *arg_strings = descriptor.split(':')
+        else:
+            base, arg_strings = descriptor, []
+
+        params = self._build_unary_params(base, arg_strings)
+        if params:
+            return UnaryOpNode(base, child, params)
+        # 无匹配参数规范时，保持原样（包含参数在 op 字符串中）
+        return UnaryOpNode(descriptor, child)
+
+    def _build_unary_params(self, base: str, arg_strings: List[str]) -> Optional[Dict[str, ConstantNode]]:
+        specs = UNARY_PARAM_SPECS.get(base)
+        if not specs:
+            return None
+
+        params: Dict[str, ConstantNode] = {}
+        for idx, (name, min_val, max_val, default) in enumerate(specs):
+            value = default
+            if idx < len(arg_strings):
+                try:
+                    value = float(arg_strings[idx])
+                except Exception:
+                    value = default
+            params[name] = ConstantNode(
+                value=value,
+                name=f"{base}_{name}",
+                min_val=min_val,
+                max_val=max_val
+            )
+        return params
 
     def _channel_allowed_vars(self, channel: str) -> List[str]:
         subset = allowed_variables_for_channel(channel, self.dsl_variables)

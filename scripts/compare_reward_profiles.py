@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""快速对比不同 reward profiles 的权重配置"""
+"""打印唯一的 Safe-Control-Gym 奖励配置，方便快速核对权重。"""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utilities.reward_profiles import get_reward_profile, list_profiles
+from utilities.reward_profiles import get_reward_profile
 
-# 重点对比的四个论文实验 profile
-FOCUS_PROFILES = ["safety_first", "tracking_first", "balanced", "robustness_stability"]
+# 仅保留 SCG 对齐 profile
+FOCUS_PROFILES = ["safe_control_tracking"]
 
 print("=" * 80)
 print("π-Flight Reward Profile 权重对比表")
@@ -71,10 +71,7 @@ print("=" * 80)
 print()
 
 intentions = {
-    "safety_first": "保守、平滑、节能 → 安全关键场景",
-    "tracking_first": "激进跟踪、允许大动作 → 性能优先场景",
-    "balanced": "折中方案、综合平衡 → 通用应用",
-    "robustness_stability": "鲁棒性+稳定性优先 → 抗扰动、增益稳定（之前主实验）",
+    "safe_control_tracking": "Safe-Control-Gym quadrotor_3D_track 对齐引用配置",
 }
 
 for name, intent in intentions.items():
@@ -82,6 +79,6 @@ for name, intent in intentions.items():
 
 print()
 print("=" * 80)
-print("✓ 所有 profiles 配置正常！")
-print("✓ 查看完整文档：REWARD_PROFILES.md")
+print("✓ SCG profile 配置正常！")
+print("✓ 其他 profile 已移除，所有脚本强制使用 SCG")
 print("=" * 80)

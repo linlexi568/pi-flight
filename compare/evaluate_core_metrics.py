@@ -418,7 +418,7 @@ def evaluate_position_rmse(
         trajectory = build_trajectory(traj_name)
         
         # 获取奖励权重
-        weights, _ = get_reward_profile('control_law_discovery')
+        weights, _ = get_reward_profile('safe_control_tracking')
         
         for trial in range(n_trials):
             try:
@@ -527,7 +527,7 @@ def evaluate_crash_rate(
         crash_reasons = {}
         
         trajectory = build_trajectory(traj_name)
-        weights, _ = get_reward_profile('control_law_discovery')
+        weights, _ = get_reward_profile('safe_control_tracking')
         
         for trial in range(n_trials):
             try:
@@ -655,7 +655,7 @@ def evaluate_disturbance_rejection(
         traj_results = {}
         
         trajectory = build_trajectory(traj_name)
-        weights, _ = get_reward_profile('control_law_discovery')
+        weights, _ = get_reward_profile('safe_control_tracking')
         
         # 1. 无扰动基线
         print(f"  测试无扰动基线...")

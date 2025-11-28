@@ -51,6 +51,15 @@ except Exception:
         from utils.reward_stepwise import StepwiseRewardCalculator  # type: ignore
     except Exception:
         StepwiseRewardCalculator = None  # type: ignore
+
+# SCG 精确 reward 计算器
+try:
+    from utils.reward_scg_exact import SCGExactRewardCalculator  # type: ignore
+except Exception:
+    try:
+        from reward_scg_exact import SCGExactRewardCalculator  # type: ignore
+    except Exception:
+        SCGExactRewardCalculator = None  # type: ignore
 try:
     from utils.gpu_program_executor import GPUProgramExecutor  # type: ignore
 except Exception:
@@ -62,6 +71,10 @@ try:
     from utilities.reward_profiles import get_reward_profile  # type: ignore
 except Exception:
     get_reward_profile = None  # type: ignore
+try:
+    from utilities.trajectory_presets import scg_position
+except Exception:
+    scg_position = None  # type: ignore
 try:
     from utils.prior_scoring import compute_prior_scores  # type: ignore
 except Exception:
@@ -132,6 +145,7 @@ def _normalize_program_structure_for_cache(obj: Any):
         return '<CONST>'
     return obj
 
+
 try:
     from utils.program_constraints import validate_program, HARD_CONSTRAINT_PENALTY
 except Exception:
@@ -142,10 +156,9 @@ except Exception:
             return True, ""
         HARD_CONSTRAINT_PENALTY = -1e6  # type: ignore
 
-
 class BatchEvaluator:
     """批量程序评估器（仅支持Isaac Gym）"""
-    
+
     def __init__(self, 
                  trajectory_config: Dict[str, Any],
                  duration: int = 20,
@@ -174,7 +187,9 @@ class BatchEvaluator:
                  enable_bayesian_tuning: bool = False,
                  bo_batch_size: int = 50,
                  bo_iterations: int = 3,
-                 bo_param_ranges: Optional[Dict[str, Tuple[float, float]]] = None):
+                 bo_param_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
+                 gpu_control_loop: Optional[bool] = None,
+                 use_scg_exact_reward: bool = False):
         """
         Args:
             trajectory_config: 轨迹配置 {'type': 'figure8', 'params': {...}}
@@ -246,6 +261,10 @@ class BatchEvaluator:
 
         self.structure_prior_weight = float(structure_prior_weight)
         self.stability_prior_weight = float(stability_prior_weight)
+        self.metric_export_keys: Tuple[str, ...] = (
+            'position_rmse',
+            'control_effort',
+        )
 
         # MAD（Magnitude-Angle-Delta）安全壳参数
         self.enable_output_mad = bool(enable_output_mad)
@@ -258,14 +277,36 @@ class BatchEvaluator:
         self.mad_max_delta_yaw = float(abs(mad_max_delta_yaw))
         self._mad_eps = 1e-6
         
-        # 初始化 Stepwise 奖励计算器（使用 control_law_discovery 权重）
-        try:
-            weights, ks = get_reward_profile(self.reward_profile)
-            # 估计 dt: Isaac 默认物理频率 240 Hz，控制频率 48 Hz -> dt ≈ 1/48
-            self._step_dt = 1.0 / 48.0
-            self._step_reward_calc = StepwiseRewardCalculator(weights, ks, dt=self._step_dt, num_envs=self.isaac_num_envs, device=self.device)
-        except Exception:
-            self._step_reward_calc = None
+        # 🎯 选择 reward 计算器
+        self.use_scg_exact_reward = bool(use_scg_exact_reward)
+        if self.reward_profile == 'safe_control_tracking':
+            # Force SCG exact reward path so we faithfully mirror the benchmark.
+            self.use_scg_exact_reward = True
+            self.metric_export_keys = ('state_cost', 'action_cost')
+        self._step_reward_calc = None
+        self._scg_reward_calc = None
+        
+        if self.use_scg_exact_reward and SCGExactRewardCalculator is not None:
+            # 使用精确 SCG reward 计算器
+            try:
+                self._scg_reward_calc = SCGExactRewardCalculator(
+                    num_envs=self.isaac_num_envs,
+                    device=self.device
+                )
+                print(f"[BatchEvaluator] ✅ 使用精确 SCG reward 计算器")
+            except Exception as e:
+                print(f"[BatchEvaluator] ⚠️ SCG reward 初始化失败: {e}，回退 Stepwise")
+                self.use_scg_exact_reward = False
+        
+        if not self.use_scg_exact_reward:
+            # 初始化 Stepwise 奖励计算器
+            try:
+                weights, ks = get_reward_profile(self.reward_profile)
+                # 估计 dt: Isaac 默认物理频率 240 Hz，控制频率 48 Hz -> dt ≈ 1/48
+                self._step_dt = 1.0 / 48.0
+                self._step_reward_calc = StepwiseRewardCalculator(weights, ks, dt=self._step_dt, num_envs=self.isaac_num_envs, device=self.device)
+            except Exception:
+                self._step_reward_calc = None
 
         # 记录最近一次安全裁剪后的 [fz, tx, ty, tz]
         self._last_safe_actions = torch.zeros((self.isaac_num_envs, 4), device=self.device)
@@ -294,6 +335,16 @@ class BatchEvaluator:
         elif self.use_gpu_expression_executor:
             print("[BatchEvaluator] ⚠️ GPUProgramExecutor 不可用，回退CPU")
             self.use_gpu_expression_executor = False
+
+        env_gpu_loop = os.getenv('ENABLE_GPU_CONTROL_LOOP', '0').lower() in ('1', 'true', 'yes')
+        if gpu_control_loop is None:
+            self._use_gpu_control_loop = bool(env_gpu_loop)
+        else:
+            self._use_gpu_control_loop = bool(gpu_control_loop)
+        if self._use_gpu_control_loop and (self._gpu_executor is None or not self.use_gpu_expression_executor):
+            self._use_gpu_control_loop = False
+        if self._use_gpu_control_loop:
+            print("[BatchEvaluator] 🚀 控制循环全GPU路径已启用")
         
         # 🚀🚀 超高性能执行器 (完全向量化 + JIT)
         if use_fast_path:
@@ -559,6 +610,18 @@ class BatchEvaluator:
                     
                 all_candidate_programs = [prog for _, prog in all_candidates]
                 eval_start_time = time_module.time()
+                
+                # 🔥 BO 内层评估时，重置 SCG reward calculator 以匹配新的批量大小
+                bo_batch_size = len(all_candidate_programs)
+                if self.use_scg_exact_reward and self._scg_reward_calc is not None:
+                    from .reward_scg_exact import SCGExactRewardCalculator
+                    self._scg_reward_calc = SCGExactRewardCalculator(
+                        num_envs=bo_batch_size,
+                        device=self.device,
+                        state_weights=self._scg_reward_calc.Q,
+                        action_weight=self._scg_reward_calc.R,
+                    )
+                
                 all_rewards = self.evaluate_batch(all_candidate_programs)
                 eval_time = time_module.time() - eval_start_time
                 print(f"[BO] 第{iter_idx+1}轮评估完成: {len(all_candidate_programs)}个候选 | 耗时{eval_time:.1f}秒")
@@ -614,6 +677,16 @@ class BatchEvaluator:
             
             bo_total_time = time_module.time() - bo_start_time
             print(f"[BatchEvaluator] ✅ 真实BO完成: {len(tuned_programs)} 个程序已通过GP-UCB优化 | 总耗时{bo_total_time:.1f}秒")
+            
+            # 🔥 BO 完成后，恢复原始批量大小的 SCG calculator
+            if self.use_scg_exact_reward and self._scg_reward_calc is not None:
+                from .reward_scg_exact import SCGExactRewardCalculator
+                self._scg_reward_calc = SCGExactRewardCalculator(
+                    num_envs=self.isaac_num_envs,
+                    device=self.device,
+                    state_weights=self._scg_reward_calc.Q,
+                    action_weight=self._scg_reward_calc.R,
+                )
             
             return tuned_programs
             
@@ -877,19 +950,10 @@ class BatchEvaluator:
         return merged
 
     def _metric_template(self) -> Dict[str, float]:
+        # 仅保留与 SCG 论文一致的两项：状态代价和控制代价
         return {
-            'position_rmse': 0.0,
-            'settling_time': 0.0,
-            'control_effort': 0.0,
-            'smoothness_jerk': 0.0,
-            'gain_stability': 0.0,
-            'saturation': 0.0,
-            'peak_error': 0.0,
-            'high_freq': 0.0,
-            'finalize_bonus': 0.0,
-            'zero_action_penalty': 0.0,
-            'structure_prior': 0.0,
-            'stability_prior': 0.0,
+            'state_cost': 0.0,
+            'action_cost': 0.0,
             'hard_constraint_violation': 0.0,
         }
 
@@ -1338,13 +1402,63 @@ class BatchEvaluator:
             w = 2.0 * np.pi / max(1e-6, period)
             x = R * np.cos(w * t); y = R * np.sin(w * t); z = vz * t
             return init + np.array([x, y, z], dtype=np.float32)
+        elif tp == 'square':
+            scale = float(params.get('scale', params.get('side', 0.8)))
+            period = float(params.get('period', 8.0))
+            plane = str(params.get('plane', 'xy')).lower()
+            axis = {'x': 0, 'y': 1, 'z': 2}
+            if len(plane) == 2 and plane[0] != plane[1]:
+                ia = axis.get(plane[0], 0); ib = axis.get(plane[1], 1)
+            else:
+                ia, ib = 0, 1
+            seg_period = max(period / 4.0, 1e-6)
+            traverse_speed = scale / seg_period
+            cycle = 0.0
+            if period > 0:
+                cycle = float(np.fmod(t, period))
+            seg_idx = int(cycle // seg_period) % 4
+            seg_time = cycle - seg_idx * seg_period
+            seg_pos = traverse_speed * seg_time
+            coord_a = 0.0
+            coord_b = 0.0
+            if seg_idx == 0:
+                coord_a = 0.0
+                coord_b = seg_pos
+            elif seg_idx == 1:
+                coord_a = -seg_pos
+                coord_b = scale
+            elif seg_idx == 2:
+                coord_a = -scale
+                coord_b = scale - seg_pos
+            else:
+                coord_a = -scale + seg_pos
+                coord_b = 0.0
+            delta = np.zeros(3, dtype=np.float32)
+            delta[ia] = coord_a
+            delta[ib] = coord_b
+            return init + delta
         else:  # figure8
-            A = float(params.get('A', 0.8)); B = float(params.get('B', 0.5)); period = float(params.get('period', 12.0))
+            # 严格对齐 safe-control-gym quadrotor_3D_track: 在给定平面内画 8 字
+            A = float(params.get('A', 1.0))
+            B = float(params.get('B', 1.0))
+            period = float(params.get('period', 5.0))
+            plane = str(params.get('plane', 'xz')).lower()
             w = 2.0 * np.pi / max(1e-6, period)
-            x = A * np.sin(w * t)
-            y = B * np.sin(w * t) * np.cos(w * t)
-            z = 0.0
-            return init + np.array([x, y, z], dtype=np.float32)
+            a_coord = A * np.sin(w * t)
+            b_coord = B * np.sin(w * t) * np.cos(w * t)
+
+            # plane 选择哪个坐标轴承载 8 字轨迹（例如 xz）
+            axis = {'x': 0, 'y': 1, 'z': 2}
+            if len(plane) == 2 and plane[0] != plane[1]:
+                ia = axis.get(plane[0], 0)
+                ib = axis.get(plane[1], 2)
+            else:
+                ia, ib = 0, 1  # 回退 xy
+
+            delta = np.zeros(3, dtype=np.float32)
+            delta[ia] = a_coord
+            delta[ib] = b_coord
+            return init + delta
     
     def evaluate_batch(self, programs: List[List[Dict[str, Any]]]) -> List[float]:
         """
@@ -1464,6 +1578,16 @@ class BatchEvaluator:
                     self._step_reward_calc = StepwiseRewardCalculator(weights, ks, dt=self._step_dt, num_envs=batch_size, device=self.device)
                 except Exception:
                     self._step_reward_calc = None
+            
+            # 🔥 为当前批次重建 SCG reward calculator（匹配 batch_size）
+            if self.use_scg_exact_reward and self._scg_reward_calc is not None:
+                from .reward_scg_exact import SCGExactRewardCalculator
+                self._scg_reward_calc = SCGExactRewardCalculator(
+                    num_envs=batch_size,
+                    device=self.device,
+                    state_weights=self._scg_reward_calc.Q,
+                    action_weight=self._scg_reward_calc.R,
+                )
             # 记录每个环境累计了多少个有效步（用于 mean 归约）
             steps_count = torch.zeros(self.isaac_num_envs, device=self.device)
             # 记录是否曾经产生过非零动作（仅针对前 batch_size）
@@ -1580,16 +1704,29 @@ class BatchEvaluator:
                         vel_tensor = self._ensure_tensor(vel)
                         omega_tensor = self._ensure_tensor(omega)
                         quat_tensor = self._ensure_tensor(quat)
-                        state_tensors, pos_err_tensor, rpy_tensor = self._prepare_gpu_state_tensors(
-                            pos_tensor, vel_tensor, omega_tensor, quat_tensor, tgt_tensor, integral_states
-                        )
                         gpu_use_mask = torch.tensor(use_u_flags, dtype=torch.bool, device=self.device)
-                        gpu_outputs = self._gpu_executor.evaluate(
-                            gpu_batch_token,
-                            state_tensors,
-                            gpu_use_mask,
-                            active_mask=(~done_flags_batch)
-                        )
+                        if self._use_gpu_control_loop:
+                            gpu_outputs, pos_err_tensor, rpy_tensor = self._gpu_executor.evaluate_from_raw_obs(
+                                gpu_batch_token,
+                                pos_tensor,
+                                vel_tensor,
+                                omega_tensor,
+                                quat_tensor,
+                                tgt_tensor,
+                                integral_states,
+                                gpu_use_mask,
+                                active_mask=(~done_flags_batch)
+                            )
+                        else:
+                            state_tensors, pos_err_tensor, rpy_tensor = self._prepare_gpu_state_tensors(
+                                pos_tensor, vel_tensor, omega_tensor, quat_tensor, tgt_tensor, integral_states
+                            )
+                            gpu_outputs = self._gpu_executor.evaluate(
+                                gpu_batch_token,
+                                state_tensors,
+                                gpu_use_mask,
+                                active_mask=(~done_flags_batch)
+                            )
                         actions[:batch_size, 2:6] = torch.where(
                             gpu_use_mask.unsqueeze(-1),
                             gpu_outputs,
@@ -2055,13 +2192,27 @@ class BatchEvaluator:
                 pos_gpu = tensor_obs['pos']
                 vel_gpu = tensor_obs['vel']
                 omega_gpu = tensor_obs['omega']
+                quat_gpu = tensor_obs['quat']  # 姿态四元数 [qx, qy, qz, qw]
                 # 目标（悬停或轨迹）
                 if self.trajectory_config.get('type') == 'hover':
                     tgt = np.array([0.0, 0.0, self.trajectory_config.get('height', 1.0)], dtype=np.float32)
                 else:
                     tgt = np.array(self.trajectory_config.get('target', [0.0, 0.0, 1.0]), dtype=np.float32)
-                # Stepwise 奖励
-                if self._step_reward_calc is not None:
+                
+                # 计算 Reward
+                if self.use_scg_exact_reward and self._scg_reward_calc is not None:
+                    # 🎯 精确 SCG reward（二次代价，无 shaping）
+                    step_reward = self._scg_reward_calc.compute_step(
+                        pos_gpu[:batch_size, :],
+                        vel_gpu[:batch_size, :],
+                        quat_gpu[:batch_size, :],
+                        omega_gpu[:batch_size, :],
+                        tgt_tensor,
+                        actions[:batch_size, 2:6],  # [fz, tx, ty, tz]
+                        done_mask=done_flags_batch
+                    )
+                elif self._step_reward_calc is not None:
+                    # Stepwise 奖励（带 shaping）
                     step_total = self._step_reward_calc.compute_step(
                         pos_gpu[:batch_size, :],
                         tgt_tensor,
@@ -2101,8 +2252,8 @@ class BatchEvaluator:
                 done_flags[:batch_size] = done_flags_batch
                 if step >= min_steps and done_flags_batch.all():
                     break
-            # 额外的 episode 末尾奖励
-            if self._step_reward_calc is not None:
+            # 额外的 episode 末尾奖励（仅 Stepwise 模式）
+            if self._step_reward_calc is not None and not self.use_scg_exact_reward:
                 bonus = self._step_reward_calc.finalize()[:batch_size]
                 total_rewards[:batch_size] += bonus
             # 在严格无先验模式下：对整集始终零动作的程序施加惩罚
@@ -2132,24 +2283,20 @@ class BatchEvaluator:
             #     except Exception:
             #         pass
             
-            # 复杂度激励：奖励使用多变量和多规则的程序
+            # 复杂度激励和先验：仅影响训练奖励，不改真实环境奖励
+            complexity_rewards = torch.zeros(batch_size, device=self.device)
             if self.complexity_bonus > 0:
-                complexity_rewards = torch.zeros(batch_size, device=self.device)
                 for i in range(batch_size):
                     prog = batch_programs[i]
-                    # 统计唯一变量数
                     unique_vars = set()
                     for rule in prog:
                         node = rule.get('node', None)
                         if node is not None:
                             vars_in_node = self._extract_variables_from_node(node)
                             unique_vars.update(vars_in_node)
-                    # 统计非空规则数
                     num_rules = sum(1 for rule in prog if rule.get('node', None) is not None)
-                    # 复杂度奖励 = 2.0 * 变量数 + 1.0 * 规则数 (激进提升)
                     bonus = self.complexity_bonus * len(unique_vars) + 0.5 * self.complexity_bonus * num_rules
                     complexity_rewards[i] = bonus
-                total_rewards[:batch_size] += complexity_rewards
                 if debug_enabled:
                     try:
                         print(f"[DebugReward] complexity bonuses: {complexity_rewards[:min(8, batch_size)].cpu().numpy()}")
@@ -2157,9 +2304,13 @@ class BatchEvaluator:
                         pass
 
             prior_bonus = self._compute_prior_bonus(batch_programs)
+            prior_struct = torch.zeros(batch_size, device=self.device)
+            prior_stab = torch.zeros(batch_size, device=self.device)
             if prior_bonus is not None:
-                total_rewards[:batch_size] += prior_bonus[0]
-            
+                # prior_bonus: (total, struct, stab)
+                prior_struct = prior_bonus[1]
+                prior_stab = prior_bonus[2]
+
             # 归约
             if self.reward_reduction == 'mean':
                 denom = torch.clamp(steps_count[:batch_size], min=1.0)
@@ -2290,6 +2441,9 @@ class BatchEvaluator:
                 obs = self._isaac_env_pool.reset(env_ids=env_ids_to_reset)
                 self._reset_action_history(env_ids_to_reset)
 
+            if self.use_scg_exact_reward and self._scg_reward_calc is not None:
+                self._scg_reward_calc.reset(num_envs=batch_size)
+
             total_rewards = torch.zeros(self.isaac_num_envs, device=self.device)
             done_flags = torch.zeros(self.isaac_num_envs, dtype=torch.bool, device=self.device)
             done_flags_batch = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
@@ -2381,16 +2535,29 @@ class BatchEvaluator:
                         vel_tensor = self._ensure_tensor(vel)
                         omega_tensor = self._ensure_tensor(omega)
                         quat_tensor = self._ensure_tensor(quat)
-                        state_tensors, pos_err_tensor, rpy_tensor = self._prepare_gpu_state_tensors(
-                            pos_tensor, vel_tensor, omega_tensor, quat_tensor, tgt_tensor, integral_states
-                        )
                         gpu_use_mask = torch.tensor(use_u_flags, dtype=torch.bool, device=self.device)
-                        gpu_outputs = self._gpu_executor.evaluate(
-                            gpu_batch_token,
-                            state_tensors,
-                            gpu_use_mask,
-                            active_mask=(~done_flags_batch)
-                        )
+                        if self._use_gpu_control_loop:
+                            gpu_outputs, pos_err_tensor, rpy_tensor = self._gpu_executor.evaluate_from_raw_obs(
+                                gpu_batch_token,
+                                pos_tensor,
+                                vel_tensor,
+                                omega_tensor,
+                                quat_tensor,
+                                tgt_tensor,
+                                integral_states,
+                                gpu_use_mask,
+                                active_mask=(~done_flags_batch)
+                            )
+                        else:
+                            state_tensors, pos_err_tensor, rpy_tensor = self._prepare_gpu_state_tensors(
+                                pos_tensor, vel_tensor, omega_tensor, quat_tensor, tgt_tensor, integral_states
+                            )
+                            gpu_outputs = self._gpu_executor.evaluate(
+                                gpu_batch_token,
+                                state_tensors,
+                                gpu_use_mask,
+                                active_mask=(~done_flags_batch)
+                            )
                         actions[:batch_size, 2:6] = torch.where(
                             gpu_use_mask.unsqueeze(-1),
                             gpu_outputs,
@@ -2504,8 +2671,22 @@ class BatchEvaluator:
                 pos_t = tensor_obs['pos']
                 vel_t = tensor_obs['vel']
                 omega_t = tensor_obs['omega']
-                # 动态目标：使用 t 对应的目标
-                if self._step_reward_calc is not None:
+                quat_t = tensor_obs['quat']  # 姿态四元数
+                
+                # 计算 Reward
+                if self.use_scg_exact_reward and self._scg_reward_calc is not None:
+                    # 🎯 精确 SCG reward
+                    step_reward = self._scg_reward_calc.compute_step(
+                        pos_t[:batch_size, :],
+                        vel_t[:batch_size, :],
+                        quat_t[:batch_size, :],
+                        omega_t[:batch_size, :],
+                        tgt_tensor,
+                        actions[:batch_size, 2:6],
+                        done_mask=done_flags_batch
+                    )
+                elif self._step_reward_calc is not None:
+                    # Stepwise 奖励
                     step_total = self._step_reward_calc.compute_step(
                         pos_t[:batch_size, :],
                         tgt_tensor,
@@ -2534,7 +2715,11 @@ class BatchEvaluator:
                     break
 
             # finalize & 额外奖惩
-            if self._step_reward_calc is not None:
+            if self.use_scg_exact_reward and self._scg_reward_calc is not None:
+                # SCG 精确模式：无 finalize bonus
+                bonus_vec = torch.zeros(batch_size, device=self.device)
+                comp_totals = self._scg_reward_calc.get_components()
+            elif self._step_reward_calc is not None:
                 bonus = self._step_reward_calc.finalize()[:batch_size]
                 total_rewards[:batch_size] += bonus
                 bonus_vec = bonus
@@ -2545,36 +2730,20 @@ class BatchEvaluator:
                     'position_rmse','settling_time','control_effort','smoothness_jerk',
                     'gain_stability','saturation','peak_error','high_freq']}
 
+            # 初始化复杂度和先验奖励（metrics模式下默认为0）
+            complexity_rewards = torch.zeros(batch_size, device=self.device)
             prior_struct = torch.zeros(batch_size, device=self.device)
             prior_stab = torch.zeros(batch_size, device=self.device)
 
-            # 复杂度激励：奖励使用多变量和多规则的程序
-            if self.complexity_bonus > 0:
-                complexity_rewards = torch.zeros(batch_size, device=self.device)
-                for i in range(batch_size):
-                    prog = batch_programs[i]
-                    unique_vars = set()
-                    for rule in prog:
-                        node = rule.get('node', None)
-                        if node is not None:
-                            vars_in_node = self._extract_variables_from_node(node)
-                            unique_vars.update(vars_in_node)
-                    num_rules = sum(1 for rule in prog if rule.get('node', None) is not None)
-                    bonus_val = self.complexity_bonus * len(unique_vars) + 0.5 * self.complexity_bonus * num_rules
-                    complexity_rewards[i] = bonus_val
-                total_rewards[:batch_size] += complexity_rewards
-
-            prior_bonus = self._compute_prior_bonus(batch_programs)
-            if prior_bonus is not None:
-                total_rewards[:batch_size] += prior_bonus[0]
-                prior_struct = prior_bonus[1]
-                prior_stab = prior_bonus[2]
-
             # 🔍 分离真实奖励和训练奖励
-            # reward_true: 纯环境奖励（不含人工惩罚）
-            # reward_train: 训练信号（含零动作惩罚等）
+            # reward_true: 纯环境奖励（仅 SCG 代价，不含任何 shaping）
+            # reward_train: 训练信号（在真实奖励基础上叠加复杂度、先验、零动作惩罚等）
             batch_rewards_true = total_rewards[:batch_size].clone()
             batch_rewards_train = total_rewards[:batch_size].clone()
+            # 复杂度和先验：只加到训练奖励，不改真实奖励
+            batch_rewards_train += complexity_rewards
+            batch_rewards_train += prior_struct
+            batch_rewards_train += prior_stab
             
             # 零动作惩罚：仅加到训练奖励上
             zero_penalty_applied = torch.zeros(batch_size, device=self.device)
@@ -2592,18 +2761,19 @@ class BatchEvaluator:
                 batch_scores_true = batch_rewards_true.cpu().numpy().tolist()
                 batch_scores_train = batch_rewards_train.cpu().numpy().tolist()
             
-            # rewards列表存储训练奖励（向后兼容，用于NN训练）
+            # rewards列表存储训练奖励（用于NN训练）
             rewards.extend(batch_scores_train)
             # rewards_true列表存储真实奖励（用于保存、输出、对比）
             rewards_true.extend(batch_scores_true)
 
-            # 逐环境组件字典（加入 finalize_bonus + zero_penalty）
-            comp_totals['finalize_bonus'] = bonus_vec
-            comp_totals['zero_action_penalty'] = zero_penalty_applied
-            comp_totals['structure_prior'] = prior_struct
-            comp_totals['stability_prior'] = prior_stab
+            # 逐环境组件字典：只导出 SCG 对齐指标
             for i in range(batch_size):
-                d = {k: float(comp_totals[k][i].item()) for k in comp_totals.keys()}
+                d: Dict[str, float] = {}
+                # 直接从 SCG 组件中读取 state_cost / action_cost
+                state_tensor = comp_totals.get('state_cost')
+                action_tensor = comp_totals.get('action_cost')
+                d['state_cost'] = float(state_tensor[i].item()) if state_tensor is not None else 0.0
+                d['action_cost'] = float(action_tensor[i].item()) if action_tensor is not None else 0.0
                 metrics_all.append(d)
 
         elapsed = time.time() - start_time

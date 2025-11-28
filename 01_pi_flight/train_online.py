@@ -78,6 +78,11 @@ except Exception as e:
     BatchEvaluator = None  # type: ignore
 
 try:
+    from utilities.trajectory_presets import get_scg_trajectory_config
+except Exception as e:
+    raise ImportError(f"无法导入 safe-control-gym 轨迹助手: {e}")
+
+try:
     from utils.prior_scoring import PRIOR_PROFILES
 except Exception:
     PRIOR_PROFILES = {"none": (0.0, 0.0)}
@@ -295,7 +300,7 @@ class OnlineTrainer:
             replicas_per_program=getattr(args, 'eval_replicas_per_program', 1),
             min_steps_frac=getattr(args, 'min_steps_frac', 0.0),
             reward_reduction=getattr(args, 'reward_reduction', 'sum'),
-            reward_profile=getattr(args, 'reward_profile', 'control_law_discovery'),  # 🔥 支持奖励配置文件切换
+            reward_profile=getattr(args, 'reward_profile', 'safe_control_tracking'),  # SCG-only reward profile
             strict_no_prior=True,  # 统一使用直接u_*控制（不依赖内置PID框架）
             zero_action_penalty=float(getattr(args, 'zero_action_penalty', 0.0)),  # 参数化零动作惩罚
             complexity_bonus=0.0,  # AlphaZero哲学：让NN自己学习复杂度权衡
@@ -315,7 +320,8 @@ class OnlineTrainer:
             enable_bayesian_tuning=getattr(args, 'enable_bayesian_tuning', False),
             bo_batch_size=getattr(args, 'bo_batch_size', 50),
             bo_iterations=getattr(args, 'bo_iterations', 3),
-            bo_param_ranges={'default': (getattr(args, 'bo_param_range_min', -3.0), getattr(args, 'bo_param_range_max', 3.0))}
+            # 参数范围兜底：如果节点自身没有 min/max，则使用此处默认值
+            bo_param_ranges={'default': (-3.0, 3.0)}
         )
         
         # 统计
@@ -344,7 +350,19 @@ class OnlineTrainer:
         if self.enable_ranking_reweight:
             print(f"[Trainer] ✅ Ranking→Policy重加权已启用 (beta={self.ranking_reweight_beta})")
         
-        # �🏆 精英程序池 (Elite Archive) - 保留Top-K最优程序
+        # 🚀 悬停推力约束配置（Hover Thrust Constraint）
+        # 强制 u_fz = hover_thrust + delta，确保无人机始终有最小升力
+        self._enforce_hover_thrust = getattr(args, 'enforce_hover_thrust', True)
+        self._hover_thrust_value = float(getattr(args, 'hover_thrust_value', 0.265))
+        self._hover_thrust_min = float(getattr(args, 'hover_thrust_min', 0.20))
+        self._hover_thrust_max = float(getattr(args, 'hover_thrust_max', 0.35))
+        self._hover_delta_max = float(getattr(args, 'hover_delta_max', 2.0))
+        if self._enforce_hover_thrust:
+            print(f"[Trainer] 🚁 悬停推力约束已启用: hover={self._hover_thrust_value:.3f}N [{self._hover_thrust_min:.2f}, {self._hover_thrust_max:.2f}], delta_max={self._hover_delta_max:.1f}N")
+        else:
+            print(f"[Trainer] ⚠️ 悬停推力约束已禁用（允许程序输出零推力）")
+        
+        # 🏆 精英程序池 (Elite Archive) - 保留Top-K最优程序
         self.elite_archive = []  # [(reward, program_copy, iter_idx), ...]
         self.elite_archive_size = getattr(args, 'elite_archive_size', 100)  
         print(f"[Trainer] 🏆 精英程序池: 保留Top-{self.elite_archive_size}最优程序")
@@ -440,33 +458,38 @@ class OnlineTrainer:
             print(f"[Trainer] ⚠️ Ranking网络未启用 (use_ranking={getattr(args, 'use_ranking', True)}, available={RANKING_AVAILABLE})")
     
     def _build_trajectory(self) -> Dict[str, Any]:
-        """构建轨迹配置"""
-        if self.args.traj == 'hover':
-            # 课程学习阶段1：不添加扰动，保持可学性；仅在非课程或后期阶段添加扰动
-            if getattr(self.args, 'curriculum_mode', 'none') != 'none':
-                stage = getattr(self, '_curriculum_stage', 1)
-                if stage == 1:
-                    return {'type': 'hover', 'initial_xyz': [0.0, 0.0, 1.0], 'params': {}}
-                else:
-                    import random as _r
-                    noise_x = _r.uniform(-0.2, 0.2) if stage == 2 else _r.uniform(-0.5, 0.5)
-                    noise_y = _r.uniform(-0.2, 0.2) if stage == 2 else _r.uniform(-0.5, 0.5)
-                    noise_z = _r.uniform(-0.1, 0.1) if stage == 2 else _r.uniform(-0.3, 0.3)
-                    return {'type': 'hover', 'initial_xyz': [noise_x, noise_y, 1.0 + noise_z], 'params': {}}
-            # 非课程模式保留原有扰动逻辑
+        """构建与 safe-control-gym 对齐的轨迹配置。"""
+        traj_cfg = get_scg_trajectory_config(self.args.traj)
+        params = dict(traj_cfg.params)
+        initial_xyz = list(traj_cfg.center)
+
+        if traj_cfg.task == 'hover':
             import random as _r
-            noise_x = _r.uniform(-0.5, 0.5)
-            noise_y = _r.uniform(-0.5, 0.5)
-            noise_z = _r.uniform(-0.3, 0.3)
-            return {'type': 'hover', 'initial_xyz': [noise_x, noise_y, 1.0 + noise_z], 'params': {}}
-        elif self.args.traj == 'figure8':
-            return {'type': 'figure8', 'initial_xyz': [0, 0, 1.0], 'params': {'A': 0.8, 'B': 0.5, 'period': 12}}
-        elif self.args.traj == 'circle':
-            return {'type': 'circle', 'initial_xyz': [0, 0, 0.8], 'params': {'R': 0.9, 'period': 10}}
-        elif self.args.traj == 'helix':
-            return {'type': 'helix', 'initial_xyz': [0, 0, 0.5], 'params': {'R': 0.7, 'period': 10, 'v_z': 0.15}}
-        else:
-            raise ValueError(f"Unknown trajectory: {self.args.traj}")
+            curriculum = getattr(self.args, 'curriculum_mode', 'none')
+            stage = getattr(self, '_curriculum_stage', 1)
+            if curriculum != 'none':
+                if stage == 1:
+                    initial_xyz = list(traj_cfg.center)
+                else:
+                    amp_xy = 0.2 if stage == 2 else 0.5
+                    amp_z = 0.1 if stage == 2 else 0.3
+                    initial_xyz = [
+                        traj_cfg.center[0] + _r.uniform(-amp_xy, amp_xy),
+                        traj_cfg.center[1] + _r.uniform(-amp_xy, amp_xy),
+                        traj_cfg.center[2] + _r.uniform(-amp_z, amp_z),
+                    ]
+            else:
+                initial_xyz = [
+                    traj_cfg.center[0] + _r.uniform(-0.5, 0.5),
+                    traj_cfg.center[1] + _r.uniform(-0.5, 0.5),
+                    traj_cfg.center[2] + _r.uniform(-0.3, 0.3),
+                ]
+
+        return {
+            'type': traj_cfg.task,
+            'initial_xyz': initial_xyz,
+            'params': params,
+        }
 
     def _compute_param_checksum(self) -> float:
         """计算模型参数的简单校验和（L2范数求和），用于观测参数是否发生更新。"""
@@ -796,6 +819,13 @@ class OnlineTrainer:
             stability_prior_weight=self.stability_prior_weight
         )
         
+        # 🚀 悬停推力约束配置
+        mcts._enforce_hover_thrust = getattr(self, '_enforce_hover_thrust', True)
+        mcts._hover_thrust_value = getattr(self, '_hover_thrust_value', 0.265)
+        mcts._hover_thrust_min = getattr(self, '_hover_thrust_min', 0.20)
+        mcts._hover_thrust_max = getattr(self, '_hover_thrust_max', 0.35)
+        mcts._hover_delta_max = getattr(self, '_hover_delta_max', 2.0)
+        
         # 🌟 设置 ranking 网络用于 MCTS bias（条件启用）
         if self.enable_ranking_mcts_bias and self.use_ranking and hasattr(self, 'ranking_net') and self.ranking_net is not None:
             mcts.ranking_net = self.ranking_net
@@ -886,154 +916,197 @@ class OnlineTrainer:
         except Exception:
             root_min_cap_k = 5  # 异常时也保证最小探索宽度
 
-        for sim_idx in range(num_simulations):
-            # Selection + Expansion（使用NN先验 + Progressive Widening）
-            node = root
-            path = [node]
+        # 🚀 Leaf Parallelization: 分批评估叶节点
+        leaf_batch_size = getattr(self.args, 'mcts_leaf_batch_size', 128)
+        num_batches = (num_simulations + leaf_batch_size - 1) // leaf_batch_size
+        
+        if num_simulations > 0:
+            print(f"[LeafParallel] MCTS simulations={num_simulations}, batch_size={leaf_batch_size}, num_batches={num_batches}")
+        
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * leaf_batch_size
+            batch_end = min((batch_idx + 1) * leaf_batch_size, num_simulations)
+            batch_pending_evals = []  # 当前批次的待评估节点
             
-            if sim_idx == 0 or sim_idx == num_simulations - 1:  # DEBUG: 首次和最后一次模拟
-                print(f"[PW-DEBUG] sim={sim_idx}, root.visits={root.visits}, root.children={len(root.children)}")
-            
-            # Selection阶段 (考虑Progressive Widening)
-            while node.children:
-                # Progressive Widening检查：是否可以扩展更多children
-                pw_c = 1.5
-                pw_alpha = 0.6
-                # Progressive Widening初始行为修正：
-                # - 以 (visits+1) 计算，避免 visits==0 时上限为0
-                # - 根节点的最小分支数由 NN 先验累计覆盖率自适应确定（不使用固定常数）
-                vis = max(0, int(node.visits))
-                base_cap = int(pw_c * ((vis + 1) ** pw_alpha))
-                min_cap = (root_min_cap_k if node.depth == 0 else 1)
-                max_children = max(min_cap, base_cap)
-                num_mutations = len(node.untried_mutations) if hasattr(node, 'untried_mutations') else 0
-                can_expand = len(node.children) < max_children and len(node.children) < num_mutations
+            for sim_idx in range(batch_start, batch_end):
+                # Selection + Expansion（使用NN先验 + Progressive Widening）
+                node = root
+                path = [node]
                 
-                if sim_idx == 0 and node.depth == 0:  # DEBUG: 只在第一次模拟打印root信息
-                    print(f"[PW-DEBUG] sim_idx={sim_idx}, depth={node.depth}, visits={node.visits}, max_children={max_children}, len(children)={len(node.children)}, num_mutations={num_mutations}, can_expand={can_expand}")
+                if sim_idx == 0 or sim_idx == num_simulations - 1:  # DEBUG: 首次和最后一次模拟
+                    print(f"[PW-DEBUG] sim={sim_idx}, root.visits={root.visits}, root.children={len(root.children)}")
                 
-                if can_expand:
-                    # 可以扩展更多children，停止selection
-                    break
-                
-                if node.is_fully_expanded():
-                    # 完全扩展，停止selection
-                    break
-                
-                # 继续向下选择
-                node = self._select_child_puct(node, root_dirichlet_noise if node.depth == 0 else None)
-                path.append(node)
-            
-            # Expansion阶段
-            if not node.is_fully_expanded():
-                # 生成新子节点，分配NN先验
-                mcts._ensure_mutations(node)
-                
-                if node.untried_mutations and len(node.expanded_actions) < len(node.untried_mutations):
-                    # 选择一个未扩展的变异
-                    unexpanded_idx = [i for i in range(len(node.untried_mutations)) 
-                                     if i not in node.expanded_actions][0]
-                    mutation = node.untried_mutations[unexpanded_idx]
+                # Selection阶段 (考虑Progressive Widening)
+                while node.children:
+                    # Progressive Widening检查：是否可以扩展更多children
+                    pw_c = 1.5
+                    pw_alpha = 0.6
+                    # Progressive Widening初始行为修正：
+                    # - 以 (visits+1) 计算，避免 visits==0 时上限为0
+                    # - 根节点的最小分支数由 NN 先验累计覆盖率自适应确定（不使用固定常数）
+                    vis = max(0, int(node.visits))
+                    base_cap = int(pw_c * ((vis + 1) ** pw_alpha))
+                    min_cap = (root_min_cap_k if node.depth == 0 else 1)
+                    max_children = max(min_cap, base_cap)
+                    num_mutations = len(node.untried_mutations) if hasattr(node, 'untried_mutations') else 0
+                    can_expand = len(node.children) < max_children and len(node.children) < num_mutations
                     
-                    # 克隆程序并应用变异
-                    child_program = [mcts._clone_rule(r) for r in node.program]
-                    mcts._apply_mutation(child_program, mutation)
-                    # 变异后也转换为AST，确保内部一致
-                    child_program = to_ast_program(child_program)
+                    if sim_idx == 0 and node.depth == 0:  # DEBUG: 只在第一次模拟打印root信息
+                        print(f"[PW-DEBUG] sim_idx={sim_idx}, depth={node.depth}, visits={node.visits}, max_children={max_children}, len(children)={len(node.children)}, num_mutations={num_mutations}, can_expand={can_expand}")
                     
-                    # ── 调试：打印被扩展的程序摘要（仅根与其下一层，限数量）──
-                    try:
-                        if getattr(self.args, 'debug_programs', False) and (node.depth <= 1):
-                            if not hasattr(self, '_debug_prog_count'):
-                                self._debug_prog_count = 0
-                            limit = int(getattr(self.args, 'debug_programs_limit', 20))
-                            if self._debug_prog_count < limit:
-                                def _summarize_rule(rule):
-                                    try:
-                                        if isinstance(rule, dict):
-                                            if 'op' in rule:
-                                                op = rule.get('op')
-                                                var = rule.get('var')
-                                                expr = rule.get('expr')
-                                                cond = rule.get('condition')
-                                                expr_type = (expr or {}).get('type') if isinstance(expr, dict) else type(expr).__name__
-                                                has_cond = cond not in (None, False)
-                                                return f"{op}:{var}|{expr_type}|cond={has_cond}"
-                                            if 'set' in rule:
-                                                s = rule.get('set')
-                                                if isinstance(s, (list, tuple)) and len(s) >= 2:
-                                                    return f"set:{s[0]}|const|cond=False"
-                                                return "set:?"
-                                            if 'if' in rule:
-                                                return "if:..."
-                                        return str(type(rule).__name__)
-                                    except Exception:
-                                        return "<err>"
-                                sets = []
-                                uses_u = False
-                                has_if = False
-                                # 统计 AST 'set' 二元操作
-                                for rr in child_program:
-                                    try:
-                                        if isinstance(rr, dict):
-                                            cond = rr.get('condition')
-                                            if hasattr(cond, 'op') and getattr(cond, 'op', None) in ('if',):
-                                                has_if = True
-                                            for act in rr.get('action', []) or []:
-                                                if hasattr(act, 'op') and act.op == 'set' and hasattr(act, 'left') and hasattr(act.left, 'value'):
-                                                    var = str(getattr(act.left, 'value', ''))
-                                                    sets.append(var)
-                                                    if var.startswith('u_'):
-                                                        uses_u = True
-                                    except Exception:
-                                        pass
-                                digest = ", ".join(_summarize_rule(r) for r in child_program[:6])
-                                print(f"[Prog] depth={node.depth+1} rules={len(child_program)} u_sets={sets} uses_u={uses_u} :: {digest}")
-                                self._debug_prog_count += 1
-                    except Exception:
-                        pass
-
-                    # 创建子节点
-                    child = MCTSNode(child_program, parent=node, depth=node.depth + 1)
-                    edit_type = mutation[0]
-                    child._edit_type = edit_type
+                    if can_expand:
+                        # 可以扩展更多children，停止selection
+                        break
                     
-                    # 🚀 优化: 检查先验缓存（不缓存value）
-                    prog_hash = get_program_hash(child_program)
-                    if prog_hash in gnn_prior_cache:
-                        # 命中缓存，直接使用先验 + LRU: 移动到队尾
-                        child._prior_p = gnn_prior_cache[prog_hash]
+                    if node.is_fully_expanded():
+                        # 完全扩展，停止selection
+                        break
+                    
+                    # 继续向下选择
+                    node = self._select_child_puct(node, root_dirichlet_noise if node.depth == 0 else None)
+                    path.append(node)
+                
+                # Expansion阶段
+                if not node.is_fully_expanded():
+                    # 生成新子节点，分配NN先验
+                    mcts._ensure_mutations(node)
+                    
+                    if node.untried_mutations and len(node.expanded_actions) < len(node.untried_mutations):
+                        # 选择一个未扩展的变异
+                        unexpanded_idx = [i for i in range(len(node.untried_mutations)) 
+                                         if i not in node.expanded_actions][0]
+                        mutation = node.untried_mutations[unexpanded_idx]
+                        
+                        # 克隆程序并应用变异
+                        child_program = [mcts._clone_rule(r) for r in node.program]
+                        mcts._apply_mutation(child_program, mutation)
+                        # 变异后也转换为AST，确保内部一致
+                        child_program = to_ast_program(child_program)
+                        
+                        # ── 调试：打印被扩展的程序摘要（仅根与其下一层，限数量）──
                         try:
-                            gnn_prior_cache.move_to_end(prog_hash, last=True)
+                            if getattr(self.args, 'debug_programs', False) and (node.depth <= 1):
+                                if not hasattr(self, '_debug_prog_count'):
+                                    self._debug_prog_count = 0
+                                limit = int(getattr(self.args, 'debug_programs_limit', 20))
+                                if self._debug_prog_count < limit:
+                                    def _summarize_rule(rule):
+                                        try:
+                                            if isinstance(rule, dict):
+                                                if 'op' in rule:
+                                                    op = rule.get('op')
+                                                    var = rule.get('var')
+                                                    expr = rule.get('expr')
+                                                    cond = rule.get('condition')
+                                                    expr_type = (expr or {}).get('type') if isinstance(expr, dict) else type(expr).__name__
+                                                    has_cond = cond not in (None, False)
+                                                    return f"{op}:{var}|{expr_type}|cond={has_cond}"
+                                                if 'set' in rule:
+                                                    s = rule.get('set')
+                                                    if isinstance(s, (list, tuple)) and len(s) >= 2:
+                                                        return f"set:{s[0]}|const|cond=False"
+                                                    return "set:?"
+                                                if 'if' in rule:
+                                                    return "if:..."
+                                            return str(type(rule).__name__)
+                                        except Exception:
+                                            return "<err>"
+                                    sets = []
+                                    uses_u = False
+                                    has_if = False
+                                    # 统计 AST 'set' 二元操作
+                                    for rr in child_program:
+                                        try:
+                                            if isinstance(rr, dict):
+                                                cond = rr.get('condition')
+                                                if hasattr(cond, 'op') and getattr(cond, 'op', None) in ('if',):
+                                                    has_if = True
+                                                for act in rr.get('action', []) or []:
+                                                    if hasattr(act, 'op') and act.op == 'set' and hasattr(act, 'left') and hasattr(act.left, 'value'):
+                                                        var = str(getattr(act.left, 'value', ''))
+                                                        sets.append(var)
+                                                        if var.startswith('u_'):
+                                                            uses_u = True
+                                        except Exception:
+                                            pass
+                                    digest = ", ".join(_summarize_rule(r) for r in child_program[:6])
+                                    print(f"[Prog] depth={node.depth+1} rules={len(child_program)} u_sets={sets} uses_u={uses_u} :: {digest}")
+                                    self._debug_prog_count += 1
                         except Exception:
                             pass
-                        # 统计：先验（child 扩展阶段）缓存命中
-                        if hasattr(self, '_mcts_stats'):
-                            self._mcts_stats['prior_cached'] = self._mcts_stats.get('prior_cached', 0) + 1
-                        # 可选调试: 仅前若干次命中打印（避免刷屏）
-                        if getattr(self, '_debug_prior_hit_printed', 0) < 10:
+
+                        # 创建子节点
+                        child = MCTSNode(child_program, parent=node, depth=node.depth + 1)
+                        edit_type = mutation[0]
+                        child._edit_type = edit_type
+                        
+                        # 🚀 优化: 检查先验缓存（不缓存value）
+                        prog_hash = get_program_hash(child_program)
+                        if prog_hash in gnn_prior_cache:
+                            # 命中缓存，直接使用先验 + LRU: 移动到队尾
+                            child._prior_p = gnn_prior_cache[prog_hash]
                             try:
-                                print(f"[PriorCacheHit] depth={child.depth} hash={prog_hash[:10]} prior_p={child._prior_p:.4f}")
+                                gnn_prior_cache.move_to_end(prog_hash, last=True)
                             except Exception:
                                 pass
-                            self._debug_prior_hit_printed = getattr(self, '_debug_prior_hit_printed', 0) + 1
+                            # 统计：先验（child 扩展阶段）缓存命中
+                            if hasattr(self, '_mcts_stats'):
+                                self._mcts_stats['prior_cached'] = self._mcts_stats.get('prior_cached', 0) + 1
+                            # 可选调试: 仅前若干次命中打印（避免刷屏）
+                            if getattr(self, '_debug_prior_hit_printed', 0) < 10:
+                                try:
+                                    print(f"[PriorCacheHit] depth={child.depth} hash={prog_hash[:10]} prior_p={child._prior_p:.4f}")
+                                except Exception:
+                                    pass
+                                self._debug_prior_hit_printed = getattr(self, '_debug_prior_hit_printed', 0) + 1
+                        else:
+                            # 未命中，加入批量推理队列
+                            child._prior_p = 1.0 / len(EDIT_TYPES)  # 默认先验
+                            child._prog_hash = prog_hash
+                            pending_gnn_nodes.append((child, edit_type))
+                        
+                        node.children.append(child)
+                        node.expanded_actions.add(unexpanded_idx)
+                        path.append(child)
+                
+                # 🔧 收集leaf待批量评估（不立即评估，全部使用真实仿真）
+                leaf = path[-1]
+                batch_pending_evals.append((leaf, path.copy()))  # 🔧 关键修复：必须使用path的副本！
+                pending_evals.append((leaf, path.copy()))  # 也保留在全局列表中（用于GNN推理）
+                
+                # ✅ 修复1: 立即更新visits (在模拟循环内, 保证PW正确计算)
+                for node in reversed(path):
+                    node.visits += 1
+            
+            # 🚀 批量评估当前批次的叶节点
+            if batch_pending_evals:
+                invalid_reasons = {}
+                valid_programs: List[List[Dict[str, Any]]] = []
+                valid_refs: List[Tuple[MCTSNode, List[MCTSNode]]] = []
+                for idx, (leaf, path) in enumerate(batch_pending_evals):
+                    program = leaf.program
+                    ok, reason = validate_program(program)
+                    if ok:
+                        valid_programs.append(program)
+                        valid_refs.append((leaf, path))
                     else:
-                        # 未命中，加入批量推理队列
-                        child._prior_p = 1.0 / len(EDIT_TYPES)  # 默认先验
-                        child._prog_hash = prog_hash
-                        pending_gnn_nodes.append((child, edit_type))
-                    
-                    node.children.append(child)
-                    node.expanded_actions.add(unexpanded_idx)
-                    path.append(child)
-            
-            # 🔧 收集leaf待批量评估（不立即评估，全部使用真实仿真）
-            leaf = path[-1]
-            pending_evals.append((leaf, path.copy()))  # 🔧 关键修复：必须使用path的副本！
-            
-            # ✅ 修复1: 立即更新visits (在模拟循环内, 保证PW正确计算)
-            for node in reversed(path):
-                node.visits += 1
+                        invalid_reasons[idx] = reason or "violates hard constraint"
+
+                rewards_valid: List[float] = []
+                if valid_programs:
+                    rewards_valid = self.evaluator.evaluate_batch(valid_programs)
+
+                valid_iter = iter(rewards_valid)
+                for idx, (leaf, path) in enumerate(batch_pending_evals):
+                    if idx in invalid_reasons:
+                        reason = invalid_reasons[idx]
+                        print(f"[HardConstraint] Reject program before sim: {reason}")
+                        reward = float(HARD_CONSTRAINT_PENALTY)
+                    else:
+                        reward = float(next(valid_iter))
+                    for node in reversed(path):
+                        # visits已在模拟循环内更新, 这里只更新value_sum
+                        node.value_sum += reward
         
         # 🚀 批量GNN推理阶段 (一次推理所有新节点，仅获取先验)
         if pending_gnn_nodes:
@@ -1063,44 +1136,6 @@ class OnlineTrainer:
                 # 批量推理失败，使用默认值
                 for child, _ in pending_gnn_nodes:
                     child._prior_p = 1.0 / len(EDIT_TYPES)
-        
-        # 🔧 批量评估阶段：全部使用真实仿真（不再使用NN value）
-        all_leaves = pending_evals  # 直接使用，不需要解包第三个参数
-        
-        if all_leaves:
-            invalid_reasons = {}
-            valid_programs: List[List[Dict[str, Any]]] = []
-            valid_refs: List[Tuple[MCTSNode, List[MCTSNode]]] = []
-            for idx, (leaf, path) in enumerate(all_leaves):
-                program = leaf.program
-                ok, reason = validate_program(program)
-                if ok:
-                    valid_programs.append(program)
-                    valid_refs.append((leaf, path))
-                else:
-                    invalid_reasons[idx] = reason or "violates hard constraint"
-
-            rewards_valid: List[float] = []
-            if valid_programs:
-                rewards_valid = self.evaluator.evaluate_batch(valid_programs)
-
-            valid_iter = iter(rewards_valid)
-            for idx, (leaf, path) in enumerate(all_leaves):
-                if idx in invalid_reasons:
-                    reason = invalid_reasons[idx]
-                    print(f"[HardConstraint] Reject program before sim: {reason}")
-                    reward = float(HARD_CONSTRAINT_PENALTY)
-                else:
-                    reward = float(next(valid_iter))
-                for node in reversed(path):
-                    # visits已在模拟循环内更新, 这里只更新value_sum
-                    node.value_sum += reward
-        
-        # 保留下面的代码用于兼容（实际不会执行，因nn_sim_leaves为空）
-        nn_sim_leaves = []
-        if False and nn_sim_leaves:
-            # 无需处理nn_sim_leaves（已在上面统一使用real simulation）
-            pass
         
         # 📊 性能统计 (可选，用于调试)
         if hasattr(self, '_mcts_stats'):
@@ -1754,7 +1789,7 @@ class OnlineTrainer:
                         'best_reward': float(self.best_reward),  # 当前最佳真实奖励
                         'trajectory': getattr(self.args, 'traj', 'unknown'),
                         'duration': getattr(self.args, 'duration', 10),
-                        'reward_profile': getattr(self.args, 'reward_profile', 'control_law_discovery'),
+                        'reward_profile': getattr(self.args, 'reward_profile', 'safe_control_tracking'),
                         'mcts_simulations': self.args.mcts_simulations,
                         'isaac_num_envs': self.args.isaac_num_envs,
                     }
@@ -1902,7 +1937,7 @@ class OnlineTrainer:
                     'best_reward': float(self.best_reward),
                     'trajectory': getattr(self.args, 'traj', 'unknown'),
                     'duration': getattr(self.args, 'duration', 10),
-                    'reward_profile': getattr(self.args, 'reward_profile', 'control_law_discovery'),
+                    'reward_profile': getattr(self.args, 'reward_profile', 'safe_control_tracking'),
                     'mcts_simulations': self.args.mcts_simulations,
                     'isaac_num_envs': self.args.isaac_num_envs,
                     'training_completed': True,
@@ -1924,7 +1959,7 @@ class OnlineTrainer:
                 print(f"⚠️  最优程序保存失败: {e}")
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description='在线训练 - AlphaZero式程序合成')
     
     # 训练参数
@@ -1994,6 +2029,21 @@ def parse_args():
     p.add_argument('--mad-max-delta-xy', type=float, default=0.03, help='输出安全壳：相邻步横向力矩变化上限')
     p.add_argument('--mad-max-delta-yaw', type=float, default=0.02, help='输出安全壳：相邻步 yaw 力矩变化上限')
     
+    # 悬停推力约束（Hover Thrust Constraint）
+    p.add_argument('--enforce-hover-thrust', dest='enforce_hover_thrust', action='store_true',
+                   help='启用悬停推力约束：强制 u_fz = hover_thrust + delta，确保无人机始终有最小升力')
+    p.add_argument('--no-enforce-hover-thrust', dest='enforce_hover_thrust', action='store_false',
+                   help='禁用悬停推力约束（允许程序输出零推力）')
+    p.set_defaults(enforce_hover_thrust=True)
+    p.add_argument('--hover-thrust-value', type=float, default=0.265,
+                   help='悬停推力基础值（牛顿），Crazyflie 默认 0.265N = 0.027kg × 9.81m/s²')
+    p.add_argument('--hover-thrust-min', type=float, default=0.20,
+                   help='悬停推力搜索下限（用于 BO 优化）')
+    p.add_argument('--hover-thrust-max', type=float, default=0.35,
+                   help='悬停推力搜索上限（用于 BO 优化）')
+    p.add_argument('--hover-delta-max', type=float, default=2.0,
+                   help='u_fz 控制增量的最大幅度（相对于悬停推力的偏移量）')
+    
     # Ranking Value Network参数（自适应奖励学习，打破平坦奖励困境）
     p.add_argument('--use-ranking', type=lambda x: str(x).lower() in ['true', '1', 'yes'], default=True, 
                    help='启用Ranking Value Network进行自适应奖励学习（默认True）')
@@ -2003,17 +2053,17 @@ def parse_args():
     p.add_argument('--ranking-blend-warmup', type=int, default=100, help='Ranking混合系数warmup轮数（默认100）')
     
     # 仿真参数（仅Isaac Gym）
-    p.add_argument('--traj', type=str, default='figure8', choices=['hover', 'figure8', 'circle', 'helix'])
-    p.add_argument('--duration', type=int, default=10, help='仿真时长（秒）')
+    # 默认直接使用 safe-control-gym quadrotor_3D_track 对齐配置
+    p.add_argument('--traj', type=str, default='figure8', choices=['hover', 'figure8', 'circle', 'helix', 'square'])
+    p.add_argument('--duration', type=int, default=5, help='仿真时长（秒），默认与 safe-control-gym quadrotor_3D_track 一致')
     p.add_argument('--isaac-num-envs', type=int, default=512, help='Isaac Gym并行环境数')
     p.add_argument('--eval-replicas-per-program', type=int, default=5, help='evaluate_single 时并行副本数，取平均以提高利用率/稳定性')
     p.add_argument('--min-steps-frac', type=float, default=0.0, help='每次评估至少执行的步数比例 [0,1]，避免过早 done 退出')
     p.add_argument('--reward-reduction', type=str, default='sum', choices=['sum','mean'], help="奖励归约方式：'sum'（步次求和）或 'mean'（步次平均）")
-    # 🔥 奖励权重配置（新增）
-    p.add_argument('--reward-profile', type=str, default='control_law_discovery', 
-                   choices=['default', 'pilight_boost', 'pilight_freq_boost', 'control_law_discovery', 'smooth_control', 'balanced_smooth', 
-                            'safety_first', 'tracking_first', 'balanced', 'robustness_stability'],
-                   help='奖励权重配置文件: smooth_control强调平滑度和控制代价，control_law_discovery强调鲁棒性（默认）')
+    # 🔥 奖励权重配置：只保留 SCG 对齐版本，避免混乱
+    p.add_argument('--reward-profile', type=str, default='safe_control_tracking',
+                   choices=['safe_control_tracking'],
+                   help='奖励权重配置文件（唯一）：safe_control_tracking，对齐 safe-control-gym quadrotor_3D_track')
     p.add_argument('--prior-profile', type=str, default='none', choices=list(PRIOR_PROFILES.keys()),
                    help='结构/稳定先验实验分组：none(A组)、structure(B组)、structure_stability(C组)')
     p.add_argument('--structure-prior-weight', type=float, default=None,
@@ -2034,8 +2084,6 @@ def parse_args():
     p.add_argument('--enable-bayesian-tuning', action='store_true', help='启用贝叶斯优化对程序常数参数进行自动调优（AAAI 2024 π-Light策略）')
     p.add_argument('--bo-batch-size', type=int, default=50, help='BO每次并行评估的参数组数（利用Isaac并行环境，默认50）')
     p.add_argument('--bo-iterations', type=int, default=3, help='BO迭代次数（默认3，总评估 batch_size × iterations 组参数）')
-    p.add_argument('--bo-param-range-min', type=float, default=-3.0, help='BO参数搜索下界（默认-3.0）')
-    p.add_argument('--bo-param-range-max', type=float, default=3.0, help='BO参数搜索上界（默认3.0）')
     
     # 保存参数
     p.add_argument('--save-path', type=str, default='01_pi_flight/results/online_best_program.json')
@@ -2048,7 +2096,7 @@ def parse_args():
     # 调试/诊断
     p.add_argument('--debug-rewards', action='store_true', help='开启逐步奖励与零动作统计的调试日志(影响性能)')
     
-    return p.parse_args()
+    return p.parse_args(args=argv)
 
 
 if __name__ == '__main__':

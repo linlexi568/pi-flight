@@ -321,10 +321,10 @@ def extract_tunable_params(program) -> List[Tuple[str, float]]:
         params: [(path, value), ...] 例如 [('rule_0_action_0_const_1', 1.5), ...]
     """
     try:
-        from core.dsl import TerminalNode, BinaryOpNode, UnaryOpNode, IfNode
+        from core.dsl import TerminalNode, ConstantNode, BinaryOpNode, UnaryOpNode, IfNode
     except ImportError:
         try:
-            from ..core.dsl import TerminalNode, BinaryOpNode, UnaryOpNode, IfNode
+            from ..core.dsl import TerminalNode, ConstantNode, BinaryOpNode, UnaryOpNode, IfNode
         except ImportError:
             print("[BayesianTuner] Error: Cannot import DSL classes")
             return []
@@ -335,7 +335,18 @@ def extract_tunable_params(program) -> List[Tuple[str, float]]:
         if isinstance(node, TerminalNode):
             if isinstance(node.value, (int, float)):
                 params.append((path_prefix, float(node.value)))
+        elif isinstance(node, ConstantNode):
+            # 显式常量节点：BO 优化的主要目标
+            params.append((path_prefix, node.value))
         elif isinstance(node, UnaryOpNode):
+            # 提取 params 字典中的 ConstantNode
+            if node.params:
+                for param_name, param_node in node.params.items():
+                    param_path = f"{path_prefix}_param_{param_name}"
+                    if isinstance(param_node, ConstantNode):
+                        params.append((param_path, param_node.value))
+                    elif isinstance(param_node, (int, float)):
+                        params.append((param_path, float(param_node)))
             _traverse(node.child, f"{path_prefix}_child")
         elif isinstance(node, BinaryOpNode):
             _traverse(node.left, f"{path_prefix}_left")
@@ -368,10 +379,10 @@ def inject_tuned_params(program, tuned_values: Dict[str, float]):
         修改后的程序（in-place 修改）
     """
     try:
-        from core.dsl import TerminalNode, BinaryOpNode, UnaryOpNode, IfNode
+        from core.dsl import TerminalNode, ConstantNode, BinaryOpNode, UnaryOpNode, IfNode
     except ImportError:
         try:
-            from ..core.dsl import TerminalNode, BinaryOpNode, UnaryOpNode, IfNode
+            from ..core.dsl import TerminalNode, ConstantNode, BinaryOpNode, UnaryOpNode, IfNode
         except ImportError:
             return program
     
@@ -379,7 +390,20 @@ def inject_tuned_params(program, tuned_values: Dict[str, float]):
         if isinstance(node, TerminalNode):
             if path_prefix in tuned_values:
                 node.value = tuned_values[path_prefix]
+        elif isinstance(node, ConstantNode):
+            if path_prefix in tuned_values:
+                node.value = tuned_values[path_prefix]
         elif isinstance(node, UnaryOpNode):
+            # 注入 params 字典中的参数
+            if node.params:
+                for param_name, param_node in node.params.items():
+                    param_path = f"{path_prefix}_param_{param_name}"
+                    if param_path in tuned_values:
+                        if isinstance(param_node, ConstantNode):
+                            param_node.value = tuned_values[param_path]
+                        elif isinstance(param_node, (int, float)):
+                            # 如果是裸值，替换为 ConstantNode
+                            node.params[param_name] = ConstantNode(tuned_values[param_path])
             _inject(node.child, f"{path_prefix}_child")
         elif isinstance(node, BinaryOpNode):
             _inject(node.left, f"{path_prefix}_left")

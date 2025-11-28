@@ -19,7 +19,7 @@
 
 4. 提交更改：
    ```bash
-   git commit -m "描述更改内容"
+   git commit -m ""
    ```
 
 5. 推送更改到远程仓库：

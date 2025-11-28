@@ -1,72 +1,39 @@
-# PPO Baseline Implementation
+# PPO Baseline for SCG-Aligned Quadrotor Tracking
 
-这个目录包含使用 Stable-Baselines3 实现的 PPO baseline，用于与 π-Flight 程序合成方法进行对比。
+This module hosts a clean PPO training pipeline that interacts with the existing Isaac Gym quadrotor environment and the exact safe-control-gym (SCG) reward used by π-Flight. It is designed to produce policies that can compete with or surpass the PID/LQR baselines under the same `reward_true` metric.
 
-## 核心特点
+## Features
 
-- **纯 Python 配置**: 所有参数硬编码在 `baseline_ppo.py` 的 `_FixedConfig` 类中，不接受命令行参数。
-- **Isaac Gym 集成**: 使用自定义 Wrapper 直接对接 Isaac Gym 的并行环境 (默认 512 个环境)。
-- **Reward Profile**: 支持与 π-Flight 相同的四种奖励配置 (`safety_first`, `tracking_first`, `balanced`, `robustness_stability`)。
+- **SCG Reward:** Rewards are computed exclusively via `SCGExactRewardCalculator`, so PPO optimizes the same cost used for π-Flight programs and PID/LQR baselines.
+- **VecEnv Wrapper:** `IsaacSCGVecEnv` exposes the Isaac Gym simulator to Stable Baselines 3 using the `[u_fz, u_tx, u_ty, u_tz]` thrust/torque channels.
+- **Training & Evaluation Utilities:** Scripts to train PPO policies and evaluate them against the SCG reward, optionally comparing with PID/LQR JSON summaries.
 
-## 文件结构
+## Quick Start
 
-```
-02_PPO/
-├── baseline_ppo.py        # 核心脚本：包含配置、环境Wrapper、训练/评估逻辑
-├── README.md              # 说明文档
-└── results/               # 结果保存目录 (自动生成)
-    └── {task}_{profile}/  # 例如 figure8_balanced/
-        ├── tensorboard/   # Tensorboard 日志
-        ├── checkpoints/   # 中间模型权重
-        └── final_model.zip # 最终模型
-```
-
-## 使用说明
-
-### 1. 配置参数
-
-打开 `baseline_ppo.py`，找到 `_FixedConfig` 类进行修改：
-
-```python
-class _FixedConfig:
-    # --- 实验设置 ---
-    mode = 'train'          # 'train' (训练) 或 'eval' (评估)
-    
-    # --- 环境设置 ---
-    task = 'figure8'        # 任务: 'hover', 'figure8', 'circle', 'helix'
-    duration = 10.0         # 单次 episode 时长 (秒)
-    isaac_num_envs = 512    # 并行环境数量 (建议保持 512 以获得高吞吐量)
-    
-    # --- 奖励设置 ---
-    # 可选: 'safety_first', 'tracking_first', 'balanced', 'robustness_stability'
-    reward_profile = 'balanced'
-    
-    # --- 训练参数 ---
-    total_timesteps = 1_000_000  # 总训练步数
-    # ... 其他 PPO 超参数
-```
-
-### 2. 运行脚本
-
-直接运行 Python 脚本（确保在激活的虚拟环境中）：
+> Ensure Isaac Gym is installed and the root `requirements.txt` (which already includes `stable_baselines3`) is installed in your virtual environment.
 
 ```bash
-# 确保已激活环境 (例如 source ../.venv/bin/activate)
-python baseline_ppo.py
+# Train PPO on the 5s figure-8 task with 32 parallel envs
+python 02_PPO/train_ppo.py \
+  --task figure8 \
+  --duration 5 \
+  --num-envs 32 \
+  --total-steps 400000 \
+  --log-dir results/ppo/figure8
+
+# Evaluate a saved checkpoint (deterministic policy)
+python 02_PPO/eval_ppo.py \
+  --model results/ppo/figure8/ppo_quadrotor_latest.zip \
+  --task figure8 \
+  --duration 5 \
+  --episodes 10
 ```
 
-### 3. 查看结果
+The evaluation script reports the mean and standard deviation of `reward_true` (negative SCG cost). Compare these numbers against `results/baseline/<task>_baseline.json` or `results/scg_aligned/*` to verify PPO outperforms PID/LQR.
 
-训练过程中会输出进度条。训练完成后，模型保存在 `02_PPO/results/` 下。
+## File Layout
 
-启动 Tensorboard 查看曲线：
+- `scg_vec_env.py` — Stable-Baselines VecEnv wrapper around `IsaacGymDroneEnv` with SCG reward.
+- `train_ppo.py` — Training entrypoint for PPO, includes checkpointing and TensorBoard logging hooks.
+- `eval_ppo.py` — Deterministic roll-out script producing SCG rewards for qualitative comparison.
 
-```bash
-tensorboard --logdir 02_PPO/results
-```
-
-## 注意事项
-
-- **环境兼容性**: 脚本内部处理了 `gym` (Isaac Gym) 和 `gymnasium` (Stable-Baselines3) 的兼容性问题。
-- **性能**: 使用 512 个并行环境，100万步通常只需要几分钟（取决于 GPU）。
-- **依赖**: 需要安装 `stable-baselines3`, `shimmy`, `tqdm`, `rich` 等库 (已包含在项目环境中)。

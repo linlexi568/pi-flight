@@ -7,7 +7,7 @@
 - 对 `results/online_best_program.json` 里的程序
 - 在 figure8 轨迹上
 - duration=8 秒
-- 使用 `control_law_discovery` 奖励
+- 使用 `safe_control_tracking` 奖励
 进行一次标准评估，并打印结果。
 
 如需修改评估设置，只改下面 CONFIG 常量，而不要在命令行加参数。
@@ -46,7 +46,7 @@ class _FixedArgs:
     log_skip: int = 2
 
     # 奖励 profile，与训练保持一致
-    reward_profile: str = "control_law_discovery"
+    reward_profile: str = "safe_control_tracking"
 
     # 其他控制相关开关：保持默认
     compose_by_gain: bool = False

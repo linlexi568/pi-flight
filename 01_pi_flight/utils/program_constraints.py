@@ -64,20 +64,25 @@ DERIVATIVES = {
 }
 
 # Channel-specific whitelists. Each set enumerates the state variables a given
-# actuator is allowed to reference. The sets are intentionally redundant so the
-# controller still has enough freedom while explicitly ruling out pathological
-# couplings such as feeding yaw error into the thrust channel.
+# actuator is allowed to reference.
+# NOTE: Keep these tight to avoid pathological cross-couplings. In particular,
+#       thrust should only depend on z-axis errors and (optionally) roll/pitch
+#       attitude terms for leveling. Do NOT allow xy position/velocity here.
 CHANNEL_ALLOWED_INPUTS: Dict[str, Set[str]] = {
     # Collective thrust: vertical position/velocity errors + roll/pitch attitude
-    # for leveling. No yaw coupling allowed.
+    # for leveling. No yaw and no xy coupling allowed.
     "u_fz": {
-        *POSITION_ERRS,
-        *VELOCITIES,
+        # z-axis errors only
+        "pos_err_z",
+        "pos_err_z_abs",
+        "vel_z",
+        "err_i_z",
+        "err_d_z",
+        # allow attitude leveling (no yaw)
         "err_p_roll",
         "err_p_pitch",
         "err_d_roll",
         "err_d_pitch",
-        "err_i_z",
     },
     # Roll torque: roll attitude + lateral/posture errors (x axis) and their rates.
     "u_tx": {
@@ -179,8 +184,18 @@ def validate_program(program: List[Dict[str, Any]]) -> Tuple[bool, str]:
     """Check whether every action in the program satisfies hard constraints."""
     for rule_idx, rule in enumerate(program or []):
         actions = rule.get('action', []) if isinstance(rule, dict) else []
+        # Disallow multiple set operations to the same channel in a single rule
+        seen_channels: Set[str] = set()
         for action_idx, action in enumerate(actions):
             ok, reason = validate_action_channel(action)
             if not ok:
                 return False, f"rule#{rule_idx}/action#{action_idx}: {reason}"
+            # track duplicates
+            if isinstance(action, BinaryOpNode) and action.op == 'set':
+                left = action.left
+                if isinstance(left, TerminalNode) and isinstance(left.value, str):
+                    ch = left.value
+                    if ch in seen_channels:
+                        return False, f"rule#{rule_idx}: duplicate set for channel '{ch}'"
+                    seen_channels.add(ch)
     return True, ""

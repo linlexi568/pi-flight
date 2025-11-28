@@ -34,12 +34,14 @@ try:
 except Exception:
     pass
 
+ISAAC_IMPORT_ERROR: Optional[BaseException] = None
 try:
     # 先导入gymapi（核心Isaac Gym），但不导入gymtorch
     from isaacgym import gymapi, gymutil
     ISAAC_GYM_AVAILABLE = True
 except Exception as _ig_e:  # 捕获并打印真实原因
     ISAAC_GYM_AVAILABLE = False
+    ISAAC_IMPORT_ERROR = _ig_e
     print("[WARNING] Isaac Gym 导入失败：", repr(_ig_e))
     print("[WARNING] 请确认已安装 isaacgym，并且 LD_LIBRARY_PATH 已包含 _bindings/linux-x86_64 目录")
 
@@ -92,9 +94,12 @@ class IsaacGymDroneEnv:
             use_gpu: 是否使用 GPU 物理
         """
         if not ISAAC_GYM_AVAILABLE:
-            raise ImportError(
-                "Isaac Gym 未安装！请从 https://developer.nvidia.com/isaac-gym 下载并安装"
+            reason = (
+                f"Isaac Gym 导入失败，原始异常: {ISAAC_IMPORT_ERROR!r}"
+                if ISAAC_IMPORT_ERROR is not None else
+                "Isaac Gym 未成功导入"
             )
+            raise ImportError(reason)
         
         self.num_envs = num_envs
         self.device = torch.device(device)
@@ -118,7 +123,7 @@ class IsaacGymDroneEnv:
         
         # PhysX 参数
         sim_params.physx.use_gpu = use_gpu
-        sim_params.physx.num_threads = 4
+        sim_params.physx.num_threads = 24  # 🚀 使用全部CPU核心加速物理模拟
         sim_params.physx.solver_type = 1  # TGS solver
         sim_params.physx.num_position_iterations = 4
         sim_params.physx.num_velocity_iterations = 1

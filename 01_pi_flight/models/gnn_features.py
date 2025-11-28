@@ -10,9 +10,9 @@ import numpy as np
 
 # 导入DSL节点类型
 try:
-    from ..core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+    from ..core.dsl import ProgramNode, TerminalNode, ConstantNode, UnaryOpNode, BinaryOpNode, IfNode
 except Exception:
-    from core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
+    from core.dsl import ProgramNode, TerminalNode, ConstantNode, UnaryOpNode, BinaryOpNode, IfNode
 
 # PyTorch Geometric (延迟导入，避免依赖问题)
 try:
@@ -27,6 +27,8 @@ except ImportError:
 # ==================== 节点特征编码配置 ====================
 
 # 节点类型 (4维 one-hot)
+# 注意：保持总特征维度为 24，不改动下游 GNN 结构。
+# ConstantNode 在数值特征里编码，而不是单独的类型维。
 NODE_TYPES = ['Terminal', 'Unary', 'Binary', 'If']
 
 # 操作符类型 (16维 one-hot + 1维 unknown)
@@ -46,8 +48,8 @@ COMMON_VARIABLES = [
     'u_fz', 'u_tx', 'u_ty', 'u_tz'
 ]
 
-# 边类型 (6种)
-EDGE_TYPES = ['left', 'right', 'child', 'condition', 'then', 'else']
+# 边类型 (7种)：保持原有 6 类，并新增 'param' 用于算子参数
+EDGE_TYPES = ['left', 'right', 'child', 'condition', 'then', 'else', 'param']
 
 
 def get_node_type_features(node: Any) -> List[float]:
@@ -85,22 +87,28 @@ def get_variable_id(var_name: str) -> int:
 
 
 def get_numerical_features(node: Any) -> List[float]:
-    """数值特征 (4维)"""
-    features = [0.0] * 4
-    
-    # [0] 是否为常数节点
+    """数值特征 (3维)
+
+    维度保持与原版一致，以兼容已有 GNN：
+    - [0]: 是否为常数节点 (TerminalNode/ConstantNode)
+    - [1]: 常数值的 tanh 归一化
+    - [2]: 变量 ID 归一化（TerminalNode with str）
+    """
+    features = [0.0] * 3
+
+    # 常数节点（包括旧的 TerminalNode(float) 和新的 ConstantNode）
     if isinstance(node, TerminalNode) and isinstance(node.value, (int, float)):
         features[0] = 1.0
-        # [1] 归一化的数值 (tanh压缩到[-1,1])
         features[1] = float(np.tanh(float(node.value)))
-    
-    # [2] 是否为变量节点
+    elif isinstance(node, ConstantNode):
+        features[0] = 1.0
+        features[1] = float(np.tanh(float(node.value)))
+
+    # 变量节点
     if isinstance(node, TerminalNode) and isinstance(node.value, str):
-        features[2] = 1.0
-        # [3] 变量ID (归一化)
         var_id = get_variable_id(node.value)
-        features[3] = var_id / (len(COMMON_VARIABLES) + 1)
-    
+        features[2] = var_id / (len(COMMON_VARIABLES) + 1)
+
     return features
 
 
@@ -108,13 +116,13 @@ def encode_node_features(node: Any) -> List[float]:
     """
     编码单个节点的特征向量
     
-    特征组成 (24维):
-    - [0-3]: 节点类型 one-hot (4)
+    特征组成 (24维，与原版保持一致):
+    - [0-3]: 节点类型 one-hot (4: Terminal/Unary/Binary/If)
     - [4-20]: 操作符 one-hot (17)
-    - [21-23]: 数值特征 (留3维，实际用到的按需)
+    - [21-23]: 数值特征 (3维)
     
     Returns:
-        24维特征向量
+        28维特征向量
     """
     features = []
     
@@ -124,10 +132,10 @@ def encode_node_features(node: Any) -> List[float]:
     # 操作符 (17维)
     features.extend(get_operator_features(node))
     
-    # 数值特征 (3维，简化版)
-    num_feats = get_numerical_features(node)[:3]
+    # 数值特征 (3维)
+    num_feats = get_numerical_features(node)
     features.extend(num_feats)
-    
+
     assert len(features) == 24, f"Feature dimension mismatch: {len(features)}"
     return features
 
@@ -174,8 +182,16 @@ def ast_to_graph_recursive(
             ast_to_graph_recursive(node.right, nodes, node_features, edges, current_idx, 'right')
     
     elif isinstance(node, UnaryOpNode):
+        # 处理子节点
         if hasattr(node, 'child') and node.child is not None:
             ast_to_graph_recursive(node.child, nodes, node_features, edges, current_idx, 'child')
+        
+        # 处理参数字典中的 ConstantNode (新增)
+        if hasattr(node, 'params') and node.params:
+            for param_name, param_node in node.params.items():
+                if isinstance(param_node, ConstantNode):
+                    # 为参数创建边，标记为特殊边类型 'param'
+                    ast_to_graph_recursive(param_node, nodes, node_features, edges, current_idx, 'param')
     
     elif isinstance(node, IfNode):
         if hasattr(node, 'condition') and node.condition is not None:

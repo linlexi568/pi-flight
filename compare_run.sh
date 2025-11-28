@@ -37,7 +37,7 @@ PID_COMMAND=(
     --traj_preset test_challenge
     --aggregate harmonic
     --duration 20
-    --reward_profile control_law_discovery
+    --reward_profile safe_control_tracking
     --output "$COMPARE_DIR/logs/pid_result.json"
 )
 

@@ -1,5 +1,5 @@
-# Copied from 01_pi_light/dsl.py for package rename
-import numpy as np, math, abc
+"""DSL 节点定义 + 可选算子级性能剖析 (OP_PROFILE=1 启用)"""
+import numpy as np, math, abc, os, time
 from collections import deque
 
 SAFE_VALUE_MIN = -6.0
@@ -26,9 +26,11 @@ def _safe_get_state(state_dict: dict, key: str) -> float:
             return 0.0
         return max(SAFE_VALUE_MIN, min(SAFE_VALUE_MAX, float(val)))
     return 0.0
+
 class ProgramNode(abc.ABC):
     def evaluate(self, state_dict: dict) -> float: ...
     def __str__(self): return 'ProgramNode'
+
 class TerminalNode(ProgramNode):
     def __init__(self,value): self.value=value
     def evaluate(self,state_dict):
@@ -40,120 +42,173 @@ class TerminalNode(ProgramNode):
         return 0.0
     def __str__(self):
         if isinstance(self.value,float): return f"{self.value:.2f}"; return str(self.value)
+
+class ConstantNode(ProgramNode):
+    """显式常量节点，用于可调参数（BO/GNN 优化目标）"""
+    def __init__(self, value: float, name: str = None, min_val: float = None, max_val: float = None):
+        self.value = float(value)
+        self.name = name
+        self.min_val = min_val
+        self.max_val = max_val
+    def evaluate(self, state_dict):
+        return float(self.value)
+    def __str__(self):
+        if self.name:
+            return f"Const({self.name}={self.value:.3f})"
+        return f"{self.value:.3f}"
+
 class UnaryOpNode(ProgramNode):
-    def __init__(self,op,child): self.op=op; self.child=child
+    def __init__(self, op, child, params=None):
+        self.op = op
+        self.child = child
+        self.params = params or {}
+        if ':' in op and not params:
+            parts = op.split(':')
+            self.op = parts[0]
+            self._legacy_params = parts[1:]
+        else:
+            self._legacy_params = None
+
+    def get_param(self, name, default_value, min_val=None, max_val=None):
+        if name in self.params:
+            param = self.params[name]
+            if isinstance(param, ConstantNode):
+                return param.value
+            elif isinstance(param, (int, float)):
+                return float(param)
+        if self._legacy_params:
+            param_map = {
+                'ema': {'alpha': 0},
+                'delay': {'k': 0},
+                'diff': {'k': 0},
+                'clamp': {'lo': 0, 'hi': 1},
+                'deadzone': {'eps': 0},
+                'rate': {'r': 0},
+                'rate_limit': {'r': 0},
+                'smooth': {'s': 0},
+                'smoothstep': {'s': 0}
+            }
+            if self.op in param_map and name in param_map[self.op]:
+                idx = param_map[self.op][name]
+                if idx < len(self._legacy_params):
+                    return float(self._legacy_params[idx])
+        return default_value
+
     def evaluate(self,sd):
-        v=self.child.evaluate(sd)
+        v = self.child.evaluate(sd)
+        _profile_enabled = os.getenv('OP_PROFILE','0') in ('1','true','True')
+        _t0 = time.perf_counter() if _profile_enabled else None
         op = self.op
-        result = None
 
         def clamp_result(val):
             return _clamp_value(val)
 
-        # 基础一元操作
-        if op=='abs': return clamp_result(abs(v))
-        if op=='sign': return clamp_result(float(np.sign(v)))
-        if op=='sin': return clamp_result(math.sin(v))
-        if op=='cos': return clamp_result(math.cos(v))
+        if op=='abs':
+            res = clamp_result(abs(v))
+            if _profile_enabled: _op_profile_record('abs', _t0)
+            return res
+        if op=='sign':
+            res = clamp_result(float(np.sign(v)))
+            if _profile_enabled: _op_profile_record('sign', _t0)
+            return res
+        if op=='sin':
+            res = clamp_result(math.sin(v))
+            if _profile_enabled: _op_profile_record('sin', _t0)
+            return res
+        if op=='cos':
+            res = clamp_result(math.cos(v))
+            if _profile_enabled: _op_profile_record('cos', _t0)
+            return res
         if op=='tan':
-            # 安全裁剪：避免 tan 在奇异点爆炸
-            try:
-                val=math.tan(v)
-            except Exception:
-                val=0.0
-            return clamp_result(val)
+            try: val=math.tan(v)
+            except Exception: val=0.0
+            res = clamp_result(val)
+            if _profile_enabled: _op_profile_record('tan', _t0)
+            return res
         if op=='log1p':
-            # log1p(|v|) 压缩幅度；避免 log(<=0) 问题
-            try:
-                return clamp_result(math.log1p(abs(v)))
-            except Exception:
-                return 0.0
+            try: res = clamp_result(math.log1p(abs(v)))
+            except Exception: res = 0.0
+            if _profile_enabled: _op_profile_record('log1p', _t0)
+            return res
         if op=='sqrt':
-            try:
-                return clamp_result(math.sqrt(abs(v)))
-            except Exception:
-                return 0.0
+            try: res = clamp_result(math.sqrt(abs(v)))
+            except Exception: res = 0.0
+            if _profile_enabled: _op_profile_record('sqrt', _t0)
+            return res
 
-        # 时序/稳定性原语（参数编码在 op 字符串中）
-        try:
-            # 统一解析前缀和参数，以":"分割
-            prefix, *args = op.split(':')
-        except Exception:
-            prefix, args = op, []
+        prefix = self.op
 
-        # ema:alpha  → y_t = (1-α) y_{t-1} + α v
         if prefix=='ema':
-            alpha = float(args[0]) if args else 0.2
+            alpha = self.get_param('alpha', 0.2, MIN_EMA_ALPHA, MAX_EMA_ALPHA)
             alpha = min(max(alpha, MIN_EMA_ALPHA), MAX_EMA_ALPHA)
-            if not hasattr(self, '_ema_prev'):
-                self._ema_prev = 0.0
+            if not hasattr(self, '_ema_prev'): self._ema_prev = 0.0
             y = (1.0 - alpha) * self._ema_prev + alpha * v
             self._ema_prev = clamp_result(y)
+            if _profile_enabled: _op_profile_record('ema', _t0)
             return self._ema_prev
 
-        # delay:k  → 返回 k 步前的 v
         if prefix=='delay':
-            k = int(float(args[0])) if args else 1
+            k = int(self.get_param('k', 1, 1, MAX_DELAY_STEPS))
             k = max(1, min(MAX_DELAY_STEPS, k))
-            if not hasattr(self, '_buf'):
-                self._buf = deque(maxlen=k)
-            # 若 maxlen 变化，重建缓冲
+            if not hasattr(self, '_buf'): self._buf = deque(maxlen=k)
             if isinstance(self._buf, deque) and self._buf.maxlen != k:
                 self._buf = deque(list(self._buf), maxlen=k)
-            # 读取输出：不足 k 步时返回 0
             out = self._buf[0] if len(self._buf) == k else 0.0
             self._buf.appendleft(v)
-            return clamp_result(float(out))
+            res = clamp_result(float(out))
+            if _profile_enabled: _op_profile_record('delay', _t0)
+            return res
 
-        # diff:k  → v - delay(v,k)
         if prefix=='diff':
-            k = int(float(args[0])) if args else 1
+            k = int(self.get_param('k', 1, 1, MAX_DIFF_STEPS))
             k = max(1, min(MAX_DIFF_STEPS, k))
-            if not hasattr(self, '_buf_d'):
-                self._buf_d = deque(maxlen=k)
+            if not hasattr(self, '_buf_d'): self._buf_d = deque(maxlen=k)
             if isinstance(self._buf_d, deque) and self._buf_d.maxlen != k:
                 self._buf_d = deque(list(self._buf_d), maxlen=k)
             prev = self._buf_d[0] if len(self._buf_d) == k else v
             self._buf_d.appendleft(v)
-            return clamp_result(float(v - prev))
+            res = clamp_result(float(v - prev))
+            if _profile_enabled: _op_profile_record('diff', _t0)
+            return res
 
-        # clamp:lo:hi  → 限幅
         if prefix=='clamp':
-            lo = float(args[0]) if len(args)>=1 else -5.0
-            hi = float(args[1]) if len(args)>=2 else 5.0
-            lo = max(SAFE_VALUE_MIN, lo)
-            hi = min(SAFE_VALUE_MAX, hi)
+            lo = self.get_param('lo', -5.0, SAFE_VALUE_MIN, SAFE_VALUE_MAX)
+            hi = self.get_param('hi', 5.0, SAFE_VALUE_MIN, SAFE_VALUE_MAX)
+            lo = max(SAFE_VALUE_MIN, lo); hi = min(SAFE_VALUE_MAX, hi)
             if lo>hi: lo,hi = hi,lo
-            return float(min(max(v, lo), hi))
+            res = float(min(max(v, lo), hi))
+            if _profile_enabled: _op_profile_record('clamp', _t0)
+            return res
 
-        # deadzone:eps  → 小误差置零
         if prefix=='deadzone':
-            eps = float(args[0]) if args else 0.01
+            eps = self.get_param('eps', 0.01, 0.0, 1.0)
             eps = min(max(0.0, eps), 1.0)
-            if abs(v) <= eps: return 0.0
-            return clamp_result(float(v - math.copysign(eps, v)))
+            if abs(v) <= eps: res = 0.0
+            else: res = clamp_result(float(v - math.copysign(eps, v)))
+            if _profile_enabled: _op_profile_record('deadzone', _t0)
+            return res
 
-        # rate: r  → 斜率限幅（Δt=1）
         if prefix=='rate' or prefix=='rate_limit':
-            r = float(args[0]) if args else 1.0
+            r = self.get_param('r', 1.0, 0.01, MAX_RATE_LIMIT)
             r = min(max(0.01, r), MAX_RATE_LIMIT)
-            if not hasattr(self, '_rate_prev'):
-                self._rate_prev = 0.0
+            if not hasattr(self, '_rate_prev'): self._rate_prev = 0.0
             y_prev = self._rate_prev
-            lo = y_prev - r
-            hi = y_prev + r
+            lo = y_prev - r; hi = y_prev + r
             y = min(max(v, lo), hi)
             self._rate_prev = clamp_result(y)
+            if _profile_enabled: _op_profile_record('rate', _t0)
             return self._rate_prev
 
-        # smooth:s  → 平滑限幅（tanh 型）
         if prefix=='smooth' or prefix=='smoothstep':
-            s = float(args[0]) if args else 1.0
+            s = self.get_param('s', 1.0, 1e-3, MAX_SMOOTH_SCALE)
             s = min(max(1e-3, s), MAX_SMOOTH_SCALE)
-            return clamp_result(float(s * math.tanh(v / s)))
+            res = clamp_result(float(s * math.tanh(v / s)))
+            if _profile_enabled: _op_profile_record('smooth', _t0)
+            return res
 
         raise ValueError('未知的一元操作:'+self.op)
     def __str__(self): return f"{self.op}({self.child})"
+
 class BinaryOpNode(ProgramNode):
     def __init__(self,op,left,right): self.op=op; self.left=left; self.right=right
     def evaluate(self,sd):
@@ -161,10 +216,8 @@ class BinaryOpNode(ProgramNode):
         if self.op=='+': return _clamp_value(l+r)
         if self.op=='-': return _clamp_value(l-r)
         if self.op=='/':
-            try:
-                val = l/ (r if abs(r) > 1e-6 else (1e-6 if r>=0 else -1e-6))
-            except Exception:
-                val = 0.0
+            try: val = l/ (r if abs(r) > 1e-6 else (1e-6 if r>=0 else -1e-6))
+            except Exception: val = 0.0
             return _clamp_value(val)
         if self.op=='>': return 1.0 if l>r else 0.0
         if self.op=='<': return 1.0 if l<r else 0.0
@@ -175,9 +228,28 @@ class BinaryOpNode(ProgramNode):
         if self.op=='!=': return 1.0 if l!=r else 0.0
         raise ValueError('未知的二元操作:'+self.op)
     def __str__(self): return f"({self.left} {self.op} {self.right})"
+
 class IfNode(ProgramNode):
     def __init__(self,condition,then_branch,else_branch): self.condition=condition; self.then_branch=then_branch; self.else_branch=else_branch
     def evaluate(self,sd):
         val = self.then_branch.evaluate(sd) if self.condition.evaluate(sd)>0 else self.else_branch.evaluate(sd)
         return _clamp_value(val)
     def __str__(self): return f"if {self.condition} then ({self.then_branch}) else ({self.else_branch})"
+
+# --- 简易算子性能剖析支持 ---
+_OP_PROFILE_STORE = {}
+
+def _op_profile_record(name: str, t0: float):
+    dt = time.perf_counter() - t0
+    rec = _OP_PROFILE_STORE.get(name)
+    if rec is None:
+        _OP_PROFILE_STORE[name] = {'time': dt, 'count': 1}
+    else:
+        rec['time'] += dt
+        rec['count'] += 1
+
+def get_op_profile(reset: bool = False):
+    out = {k: {'avg_us': (v['time']/v['count'])*1e6, 'count': v['count'], 'total_ms': v['time']*1e3} for k,v in _OP_PROFILE_STORE.items()}
+    if reset:
+        _OP_PROFILE_STORE.clear()
+    return out
