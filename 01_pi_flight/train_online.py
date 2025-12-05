@@ -301,6 +301,7 @@ class OnlineTrainer:
             min_steps_frac=getattr(args, 'min_steps_frac', 0.0),
             reward_reduction=getattr(args, 'reward_reduction', 'sum'),
             reward_profile=getattr(args, 'reward_profile', 'safe_control_tracking'),  # SCG-only reward profile
+            use_scg_exact_reward=True,
             strict_no_prior=True,  # 统一使用直接u_*控制（不依赖内置PID框架）
             zero_action_penalty=float(getattr(args, 'zero_action_penalty', 0.0)),  # 参数化零动作惩罚
             complexity_bonus=0.0,  # AlphaZero哲学：让NN自己学习复杂度权衡

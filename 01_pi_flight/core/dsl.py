@@ -236,6 +236,90 @@ class IfNode(ProgramNode):
         return _clamp_value(val)
     def __str__(self): return f"if {self.condition} then ({self.then_branch}) else ({self.else_branch})"
 
+
+def reset_node_state(node) -> None:
+    """递归重置 AST 节点的内部状态（ema, delay, diff, rate 等时间算子的缓冲区）。
+    
+    在每次评估程序前调用此函数，确保评估结果是确定性的、可复现的。
+    支持 AST 对象和 JSON dict 两种格式。
+    """
+    if node is None:
+        return
+    
+    # 如果是 JSON dict，跳过（dict 没有运行时状态）
+    if isinstance(node, dict):
+        # JSON dict 格式没有运行时状态缓冲区，递归处理子节点
+        node_type = node.get('type', '')
+        if node_type == 'Unary':
+            reset_node_state(node.get('child'))
+        elif node_type == 'Binary':
+            reset_node_state(node.get('left'))
+            reset_node_state(node.get('right'))
+        elif node_type == 'If':
+            reset_node_state(node.get('condition'))
+            reset_node_state(node.get('then'))
+            reset_node_state(node.get('else'))
+        return
+    
+    # 重置 UnaryOpNode 的状态缓冲区
+    if isinstance(node, UnaryOpNode):
+        # ema 状态
+        if hasattr(node, '_ema_prev'):
+            node._ema_prev = 0.0
+        # delay 状态
+        if hasattr(node, '_buf'):
+            node._buf.clear()
+        # diff 状态
+        if hasattr(node, '_buf_d'):
+            node._buf_d.clear()
+        # rate/rate_limit 状态
+        if hasattr(node, '_rate_prev'):
+            node._rate_prev = 0.0
+        # 递归处理子节点
+        reset_node_state(node.child)
+    
+    # BinaryOpNode: 递归处理左右子节点
+    elif isinstance(node, BinaryOpNode):
+        reset_node_state(node.left)
+        reset_node_state(node.right)
+    
+    # IfNode: 递归处理条件和两个分支
+    elif isinstance(node, IfNode):
+        reset_node_state(node.condition)
+        reset_node_state(node.then_branch)
+        reset_node_state(node.else_branch)
+
+
+def reset_program_state(program) -> None:
+    """重置整个程序（规则列表）中所有 AST 节点的状态。
+    
+    Args:
+        program: 程序规则列表，每个规则包含 'condition' 和 'action'
+                 支持 AST 对象和 JSON dict 两种格式
+    """
+    if not program:
+        return
+    
+    for rule in program:
+        # 重置条件节点
+        cond = rule.get('condition')
+        if cond is not None:
+            reset_node_state(cond)
+        
+        # 重置动作节点
+        for action in rule.get('action', []) or []:
+            # AST 对象
+            if hasattr(action, 'left'):
+                reset_node_state(action.left)
+            if hasattr(action, 'right'):
+                reset_node_state(action.right)
+            # JSON dict
+            if isinstance(action, dict):
+                reset_node_state(action.get('left'))
+                reset_node_state(action.get('right'))
+                reset_node_state(action.get('child'))
+
+
 # --- 简易算子性能剖析支持 ---
 _OP_PROFILE_STORE = {}
 

@@ -219,71 +219,90 @@ def quat_to_euler_np(quat: np.ndarray) -> np.ndarray:
     return np.array([roll, pitch, yaw], dtype=np.float32)
 
 
-def evaluate_params(controller, task: str, duration: float, episodes: int = 3) -> Dict[str, Any]:
+def evaluate_params(controller, task: str, duration: float, episodes: int = 3, num_envs: int = 1) -> Dict[str, Any]:
     if np is None or torch is None:
         raise RuntimeError("Required packages numpy/torch are not installed. Activate venv and pip install -r requirements.txt.")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    env = IsaacGymDroneEnv(num_envs=1, device=device, headless=True, duration_sec=duration)
-    ctrl_freq = getattr(env, 'control_freq', 48.0)
-    dt = 1.0 / float(ctrl_freq)
+    env = IsaacGymDroneEnv(num_envs=num_envs, device=device, headless=True, duration_sec=duration)
+    try:
+        ctrl_freq = getattr(env, 'control_freq', 48.0)
+        dt = 1.0 / float(ctrl_freq)
 
-    reward_calc = SCGExactRewardCalculator(num_envs=1, device=device)
+        reward_calc = SCGExactRewardCalculator(num_envs=num_envs, device=device)
 
-    cfg = get_scg_trajectory_config(task)
-    center = np.array(cfg.center, dtype=np.float32)
+        cfg = get_scg_trajectory_config(task)
+        center = np.array(cfg.center, dtype=np.float32)
 
-    def make_targets(t: float) -> Tuple[np.ndarray, np.ndarray]:
-        pos, vel = scg_position_velocity(task, t, params=cfg.params, center=center)
-        return np.asarray(pos, dtype=np.float32), np.asarray(vel, dtype=np.float32)
+        def make_targets(t: float) -> Tuple[np.ndarray, np.ndarray]:
+            pos, vel = scg_position_velocity(task, t, params=cfg.params, center=center)
+            return np.asarray(pos, dtype=np.float32), np.asarray(vel, dtype=np.float32)
 
-    ep_rewards = []
-    rmses = []
-    for _ in range(episodes):
-        env.reset()
-        reward_calc.reset(1)
-        if hasattr(controller, 'set_dt'):
-            controller.set_dt(dt)
-        if hasattr(controller, 'reset'):
-            controller.reset()
-        t = 0.0
-        steps = int(duration * ctrl_freq)
-        pos_errs = []
-        for s in range(steps):
-            obs = env.get_obs()
-            pos = np.asarray(obs['position'][0], dtype=np.float32)
-            vel = np.asarray(obs['velocity'][0], dtype=np.float32)
-            quat = np.asarray(obs['orientation'][0], dtype=np.float32)
-            omega = np.asarray(obs['angular_velocity'][0], dtype=np.float32)
-            tgt_pos, tgt_vel = make_targets(t)
-            action4 = controller.compute(pos, vel, quat, omega, tgt_pos, tgt_vel)
-            # map to 6D forces: [fx, fy, fz, tx, ty, tz]
-            forces = torch.zeros(1, 6, device=device)
-            forces[0, 2] = float(action4[0])
-            forces[0, 3] = float(action4[1])
-            forces[0, 4] = float(action4[2])
-            forces[0, 5] = float(action4[3])
-            obs_next, _, done, _ = env.step(forces)
-            # reward
-            pos_t = torch.tensor(obs_next['position'], device=device)
-            vel_t = torch.tensor(obs_next['velocity'], device=device)
-            quat_t = torch.tensor(obs_next['orientation'], device=device)
-            omega_t = torch.tensor(obs_next['angular_velocity'], device=device)
-            target_pos_t = torch.tensor(tgt_pos, device=device)
-            reward = reward_calc.compute_step(pos_t, vel_t, quat_t, omega_t, target_pos_t, forces)
-            # accumulate
-            pos_errs.append(float(np.linalg.norm(pos - tgt_pos)))
-            t += dt
-        # episode metrics
-        comps = reward_calc.get_components()
-        total_cost = float((comps['total_cost']).sum().item())
-        true_reward = -total_cost
-        ep_rewards.append(true_reward)
-        rmses.append(float(np.sqrt(np.mean(np.array(pos_errs)**2))))
-    return {
-        'mean_true_reward': float(np.mean(ep_rewards)),
-        'std_true_reward': float(np.std(ep_rewards)),
-        'rmse_pos': float(np.mean(rmses)),
-    }
+        # 批量评估：每个episode在所有环境中并行运行
+        all_rewards = []
+        all_rmses = []
+        
+        for ep in range(episodes):
+            env.reset()
+            reward_calc.reset(num_envs)
+            if hasattr(controller, 'set_dt'):
+                controller.set_dt(dt)
+            if hasattr(controller, 'reset'):
+                controller.reset()
+            
+            t = 0.0
+            steps = int(duration * ctrl_freq)
+            pos_errs = []
+            
+            for s in range(steps):
+                obs = env.get_obs()
+                tgt_pos, tgt_vel = make_targets(t)
+                
+                # 为每个环境计算控制动作
+                forces = torch.zeros(num_envs, 6, device=device)
+                for i in range(num_envs):
+                    pos = np.asarray(obs['position'][i], dtype=np.float32)
+                    vel = np.asarray(obs['velocity'][i], dtype=np.float32)
+                    quat = np.asarray(obs['orientation'][i], dtype=np.float32)
+                    omega = np.asarray(obs['angular_velocity'][i], dtype=np.float32)
+                    action4 = controller.compute(pos, vel, quat, omega, tgt_pos, tgt_vel)
+                    forces[i, 2] = float(action4[0])
+                    forces[i, 3] = float(action4[1])
+                    forces[i, 4] = float(action4[2])
+                    forces[i, 5] = float(action4[3])
+                
+                obs_next, _, done, _ = env.step(forces)
+                
+                # 计算奖励
+                pos_t = torch.tensor(obs_next['position'], device=device)
+                vel_t = torch.tensor(obs_next['velocity'], device=device)
+                quat_t = torch.tensor(obs_next['orientation'], device=device)
+                omega_t = torch.tensor(obs_next['angular_velocity'], device=device)
+                target_pos_t = torch.tensor(np.tile(tgt_pos, (num_envs, 1)), device=device)
+                reward = reward_calc.compute_step(pos_t, vel_t, quat_t, omega_t, target_pos_t, forces)
+                
+                # 累积位置误差
+                pos_err = np.linalg.norm(obs_next['position'] - tgt_pos, axis=1)
+                pos_errs.append(pos_err)
+                
+                t += dt
+            
+            # Episode结束，收集所有环境的指标
+            comps = reward_calc.get_components()
+            total_costs = (comps['total_cost']).cpu().numpy()
+            true_rewards = -total_costs
+            all_rewards.extend(true_rewards.tolist())
+            
+            pos_errs_array = np.array(pos_errs)  # [steps, num_envs]
+            rmses = np.sqrt(np.mean(pos_errs_array**2, axis=0))  # [num_envs]
+            all_rmses.extend(rmses.tolist())
+        
+        return {
+            'mean_true_reward': float(np.mean(all_rewards)),
+            'std_true_reward': float(np.std(all_rewards)),
+            'rmse_pos': float(np.mean(all_rmses)),
+        }
+    finally:
+        env.close()
 
 
 def local_random_search(base: Dict[str, float],
@@ -297,6 +316,7 @@ def local_random_search(base: Dict[str, float],
     best_params = dict(base)
     best_metrics = eval_fn(best_params, task, duration, episodes_per_eval)
     best_reward = best_metrics['mean_true_reward']
+    print(f"[Init] Base reward={best_reward:.3f} rmse={best_metrics['rmse_pos']:.4f}")
 
     for i in range(trials):
         ratio = 1.0
@@ -310,15 +330,23 @@ def local_random_search(base: Dict[str, float],
             center = v
             proposal[k] = float(np.clip(center + np.random.uniform(-span, span), lo, hi))
         metrics = eval_fn(proposal, task, duration, episodes_per_eval)
-        if metrics['mean_true_reward'] > best_reward:
-            best_reward = metrics['mean_true_reward']
+        current_reward = metrics['mean_true_reward']
+        
+        # 每10次迭代显示一次当前进度
+        if (i + 1) % 10 == 0:
+            print(f"[Trial {i+1}/{trials}] Current={current_reward:.3f} Best={best_reward:.3f} (ratio={ratio:.2f})")
+        
+        if current_reward > best_reward:
+            best_reward = current_reward
             best_params = proposal
             best_metrics = metrics
-            print(f"[Update] i={i} reward={best_reward:.3f} params={best_params}")
+            print(f"  ✓ [IMPROVED] reward={best_reward:.3f} rmse={best_metrics['rmse_pos']:.4f}")
+    
+    print(f"[Final] Best reward={best_reward:.3f} after {trials} trials")
     return best_params, best_metrics
 
 
-def build_controller_eval(algo: str, pid_mode: str = 'cascade', lqr_mode: str = 'pure'):
+def build_controller_eval(algo: str, pid_mode: str = 'cascade', lqr_mode: str = 'pure', num_envs: int = 1):
     if algo == 'pid':
         def eval_pid(params: Dict[str, float], task: str, duration: float, episodes: int):
             ctrl = IsaacPIDController(**params)
@@ -329,7 +357,7 @@ def build_controller_eval(algo: str, pid_mode: str = 'cascade', lqr_mode: str = 
                 ctrl.kp_yaw = 0.0
                 ctrl.kd_yaw = 0.0
                 ctrl.att_scale = params.get('att_scale', ctrl.att_scale) * 0.1
-            return evaluate_params(ctrl, task, duration, episodes)
+            return evaluate_params(ctrl, task, duration, episodes, num_envs=num_envs)
         return eval_pid
     elif algo == 'lqr':
         def eval_lqr(params: Dict[str, float], task: str, duration: float, episodes: int):
@@ -364,7 +392,7 @@ def build_controller_eval(algo: str, pid_mode: str = 'cascade', lqr_mode: str = 
                     torque = np.clip(torque, -ctrl.torque_clip, ctrl.torque_clip)
                     return np.array([fz, torque[0], torque[1], torque[2]], dtype=np.float32)
                 ctrl.compute = pure_compute  # type: ignore
-            return evaluate_params(ctrl, task, duration, episodes)
+            return evaluate_params(ctrl, task, duration, episodes, num_envs=num_envs)
         return eval_lqr
     else:
         raise ValueError('algo must be pid or lqr')

@@ -98,6 +98,15 @@ try:
 except Exception:
     _serialize_program = None  # type: ignore
 
+# 重置 AST 节点状态（确保每次评估的确定性）
+try:
+    from core.dsl import reset_program_state  # type: ignore
+except Exception:
+    try:
+        from dsl import reset_program_state  # type: ignore
+    except Exception:
+        reset_program_state = None  # type: ignore
+
 
 @dataclass
 class ProgramParamCandidate:
@@ -449,14 +458,6 @@ class BatchEvaluator:
                 from envs.isaac_gym_drone_env import IsaacGymDroneEnv
             except ImportError:
                 raise ImportError("无法导入IsaacGymDroneEnv，请检查envs目录")
-        # 控制器
-        try:
-            from utils.segmented_controller import PiLightSegmentedPIDController
-        except ImportError:
-            try:
-                from segmented_controller import PiLightSegmentedPIDController
-            except ImportError:
-                PiLightSegmentedPIDController = None  # type: ignore
         
         # 创建环境池
         self._isaac_env_pool = IsaacGymDroneEnv(
@@ -1605,59 +1606,19 @@ class BatchEvaluator:
             # 调试开关（需尽早声明，避免未定义引用）
             debug_enabled = bool(int(os.getenv('DEBUG_STEPWISE', '0')))
 
-            # 准备每个程序对应的控制器/模式
-            controllers = []
-            use_u_flags = []  # True 表示该程序直接输出 (fz,tx,ty,tz)
+            # 所有程序统一使用 u_* 直接输出路径（不再依赖 PID 封装）
+            controllers = [None for _ in range(batch_size)]
+            use_u_flags = [True for _ in range(batch_size)]  # 全部使用直接力/力矩输出
             gpu_batch_token = None
-            try:
-                from .segmented_controller import PiLightSegmentedPIDController
-            except ImportError:
-                try:
-                    from utils.segmented_controller import PiLightSegmentedPIDController
-                except ImportError:
-                    PiLightSegmentedPIDController = None  # type: ignore
-            if self.strict_no_prior:
-                # 严格无先验：统一走 u_* 路径
-                controllers = [None for _ in range(batch_size)]
-                use_u_flags = [True for _ in range(batch_size)]
-                if debug_enabled:
-                    print("[DebugReward] strict_no_prior=ON → all programs use direct u_* path")
-            else:
-                if PiLightSegmentedPIDController is not None:
-                    for prog in batch_programs:
-                        if self._program_uses_u(prog):
-                            controllers.append(None)
-                            use_u_flags.append(True)
-                        else:
-                            controllers.append(
-                                PiLightSegmentedPIDController(
-                                    program=prog,
-                                    suppress_init_print=True,
-                                    semantics='compose_by_gain',
-                                    min_hold_steps=2
-                                )
-                            )
-                            use_u_flags.append(False)
-                    # 调试：统计本批可解析的分段规则数量
-                    if debug_enabled:
-                        try:
-                            seg_counts = []
-                            for i in range(len(controllers)):
-                                if controllers[i] is None:
-                                    seg_counts.append(-1)  # -1 表示走 u_* 路径
-                                else:
-                                    try:
-                                        seg_counts.append(int(len(getattr(controllers[i], 'segments', []) or [])))
-                                    except Exception:
-                                        seg_counts.append(0)
-                            print("[DebugReward] controller segments per-prog:", seg_counts[:min(8, len(seg_counts))])
-                        except Exception:
-                            pass
-                else:
-                    controllers = [None for _ in range(batch_size)]
-                    # 无控制器实现时，一律走 u_* 路径（若程序不含 u_*，则保持 0）
-                    for prog in batch_programs:
-                        use_u_flags.append(self._program_uses_u(prog))
+            
+            # 🔧 重置每个程序的时间算子状态（ema/delay/diff/rate）
+            # 确保每次评估从零状态开始，保证训练与测试一致性
+            if reset_program_state is not None:
+                for prog in batch_programs:
+                    reset_program_state(prog)
+            
+            if debug_enabled:
+                print("[DebugReward] All programs use direct u_* (force/torque) output path")
 
                 if (self._gpu_executor is not None and self.use_gpu_expression_executor and any(use_u_flags)):
                     try:
@@ -2466,45 +2427,24 @@ class BatchEvaluator:
             ]
             debug_enabled = bool(int(os.getenv('DEBUG_STEPWISE', '0')))
 
-            try:
-                from .segmented_controller import PiLightSegmentedPIDController
-            except ImportError:
-                try:
-                    from utils.segmented_controller import PiLightSegmentedPIDController
-                except ImportError:
-                    PiLightSegmentedPIDController = None  # type: ignore
+            # 所有程序统一使用 u_* 直接输出路径（不再依赖 PID 封装）
             gpu_batch_token = None
-            if self.strict_no_prior:
-                controllers = [None for _ in range(batch_size)]
-                use_u_flags = [True for _ in range(batch_size)]
-            else:
-                controllers = []
-                use_u_flags = []
-                # UltraFast 仅在所有程序为常量 set 情况下启用（metrics 评估同理）
-                if self.use_fast_path and self._ultra_executor is not None:
-                    try:
-                        if not self._all_programs_const(batch_programs):
-                            self._ultra_executor = None
-                    except Exception:
+            controllers = [None for _ in range(batch_size)]
+            use_u_flags = [True for _ in range(batch_size)]  # 全部使用直接力/力矩输出
+            
+            # 🔧 重置每个程序的时间算子状态（ema/delay/diff/rate）
+            # 确保每次评估从零状态开始，保证训练与测试一致性
+            if reset_program_state is not None:
+                for prog in batch_programs:
+                    reset_program_state(prog)
+            
+            # UltraFast 仅在所有程序为常量 set 情况下启用（metrics 评估同理）
+            if self.use_fast_path and self._ultra_executor is not None:
+                try:
+                    if not self._all_programs_const(batch_programs):
                         self._ultra_executor = None
-                    if PiLightSegmentedPIDController is not None:
-                        for prog in batch_programs:
-                            if self._program_uses_u(prog):
-                                controllers.append(None); use_u_flags.append(True)
-                            else:
-                                controllers.append(
-                                    PiLightSegmentedPIDController(
-                                        program=prog,
-                                        suppress_init_print=True,
-                                        semantics='compose_by_gain',
-                                        min_hold_steps=2
-                                    )
-                                )
-                                use_u_flags.append(False)
-                    else:
-                        controllers = [None for _ in range(batch_size)]
-                        for prog in batch_programs:
-                            use_u_flags.append(self._program_uses_u(prog))
+                except Exception:
+                    self._ultra_executor = None
 
                     if (self._gpu_executor is not None and self.use_gpu_expression_executor and any(use_u_flags)):
                         try:
@@ -2843,7 +2783,7 @@ class BatchEvaluator:
         Returns:
             action: [4] = [thrust, roll_rate, pitch_rate, yaw_rate]
         
-        TODO: 集成完整的 PiLightSegmentedPIDController
+        Note: 现在所有程序直接输出 u_fz/u_tx/u_ty/u_tz，不再使用 PID 封装
         """
         # 当前返回悬停控制（占位符）
         # 实际应该：

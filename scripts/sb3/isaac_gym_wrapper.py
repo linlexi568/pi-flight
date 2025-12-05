@@ -615,7 +615,8 @@ class IsaacGymSB3VecEnv:
         # 处理 done 的环境（自动 reset）
         done_indices = np.where(dones)[0]
         if len(done_indices) > 0:
-            env.reset_envs(done_indices.tolist())
+            env_ids_tensor = torch.tensor(done_indices, dtype=torch.long, device=self.device)
+            env.reset(env_ids=env_ids_tensor)
             self._step_counts[done_indices] = 0
         
         obs = self._get_all_obs()

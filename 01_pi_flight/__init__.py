@@ -11,9 +11,6 @@ import symbols from both legacy flat layout and the new split layout:
 """
 from .core.dsl import ProgramNode, TerminalNode, UnaryOpNode, BinaryOpNode, IfNode
 
-# Stable import for segmented controller (now in utils/)
-from .utils.segmented_controller import PiLightSegmentedPIDController
-
 # 为了兼容 Python 3.8（避免在导入时触发不兼容的类型注解），延迟导入 MCTS_Agent。
 def _load_mcts_agent():
     try:
@@ -28,5 +25,5 @@ def _load_mcts_agent():
 
 __all__ = [
     'ProgramNode','TerminalNode','UnaryOpNode','BinaryOpNode','IfNode',
-    'PiLightSegmentedPIDController','_load_mcts_agent'
+    '_load_mcts_agent'
 ]
